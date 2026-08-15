@@ -1,0 +1,16 @@
+# local secrets
+windows-auth-test.md
+*.key
+.secrets/
+auth.json.bak*
+*-secret*
+
+# local notes
+PLAN.md
+gptreview.md
+review.md
+review-v3-content-for-grok.md
+windows-test.md
+windows-test-results.md
+github-preview.html
+
