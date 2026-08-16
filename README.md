@@ -17,7 +17,6 @@ The provider implementation is based on the MIT-licensed [`safzanpirani/pi-comma
 If the older upstream provider is installed, remove it first so only one extension registers `commandcode`:
 
 ```console
-pi remove git:github.com/safzanpirani/pi-commandcode-provider
 pi install git:github.com/gonegirl07/commandcode-go-for-pi
 ```
 
