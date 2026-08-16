@@ -5,6 +5,10 @@ windows-auth-test.md
 auth.json.bak*
 *-secret*
 
+# dependencies and package artifacts
+node_modules/
+*.tgz
+
 # local notes
 PLAN.md
 gptreview.md

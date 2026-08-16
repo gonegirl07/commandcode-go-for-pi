@@ -1,34 +1,31 @@
-# commandcode-go-for-pi
+# Command Code Go for Pi
 
-Use a [Command Code](https://commandcode.ai) Go plan with [Pi Coding Agent](https://pi.dev) on Ubuntu and Windows.
+Use a [Command Code](https://commandcode.ai) Go plan as a provider in [Pi Coding Agent](https://pi.dev). This repository is a self-contained Pi extension: one install registers the provider, model catalog, `/alpha/generate` transport, tool calling, and reasoning controls.
 
-This repo is a tested setup guide: install Command Code in Pi, write auth without wiping other providers, and check that models answer.
+Unofficial and not affiliated with Command Code or Pi. The extension uses an undocumented endpoint that may change. Review the source before installation; Pi extensions run with your user permissions.
 
-Pi is [Pi Coding Agent](https://pi.dev). Command Code support currently comes from [safzanpirani/pi-commandcode-provider](https://github.com/safzanpirani/pi-commandcode-provider). This repo does not contain that extension.
+The provider implementation is based on the MIT-licensed [`safzanpirani/pi-commandcode-provider`](https://github.com/safzanpirani/pi-commandcode-provider), with local reasoning, authentication, packaging, and regression-test updates.
 
-Unofficial. Not affiliated with Command Code or Pi. The extension uses an undocumented Command Code endpoint, so it can break, and a Go plan may not be treated as allowed. Pi packages run with your user access — read the extension before installing it.
+## Requirements
 
-## Tested
-
-2026-08-15, extension commit [`c41f3b2`](https://github.com/safzanpirani/pi-commandcode-provider/commit/c41f3b2ee2fe226658da886dd36ba3f22cff0a43).
-
-- Ubuntu, Pi 0.84.x: install, list models, file auth, live reply
-- Windows 10 (PowerShell, cmd, Git Bash), Pi 0.84.1: install, list models, file-auth `pong`; env-only returned 401
-- macOS: not tested
+- Pi 0.84.2 or newer and Node.js 22.19 or newer.
+- A `user_...` key from [Command Code settings](https://commandcode.ai/settings).
+- A Command Code plan that permits the selected model.
 
 ## Install
 
-Need `pi` on PATH and a `user_...` key from https://commandcode.ai/settings
+If the older upstream provider is installed, remove it first so only one extension registers `commandcode`:
 
 ```console
-pi install git:github.com/safzanpirani/pi-commandcode-provider
+pi remove git:github.com/safzanpirani/pi-commandcode-provider
+pi install git:github.com/gonegirl07/commandcode-go-for-pi
 ```
 
-## Auth
+Restart Pi or run `/reload` after installation.
 
-Config dir: `$PI_CODING_AGENT_DIR` if set, else `~/.pi/agent`. On Windows that is often `%USERPROFILE%\.pi\agent`.
+## Authentication
 
-If `auth.json` exists, copy a backup. Merge the block below. Keep other providers. On Unix: `chmod 0600`.
+Pi's config directory is `$PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`. Back up an existing `auth.json`, then merge this entry without deleting other providers:
 
 ```json
 {
@@ -39,28 +36,48 @@ If `auth.json` exists, copy a backup. Merge the block below. Keep other provider
 }
 ```
 
-`auth.json` wins over env. The extension reads `COMMANDCODE_API_KEY`, not `COMMAND_CODE_API_KEY`. Prefer the file; env-only returned 401 on the Windows test machine.
+On Unix, protect the file with `chmod 0600 ~/.pi/agent/auth.json`. The `COMMANDCODE_API_KEY` environment variable is also supported.
 
-## Check
+## Reasoning
+
+DeepSeek V4 Pro and V4 Flash expose only levels verified by Command Code:
+
+| Pi level | Request behavior |
+| --- | --- |
+| `off` | Omits `params.reasoning_effort` |
+| `high` | Sends `params.reasoning_effort: "high"` |
+| `max` | Sends `params.reasoning_effort: "max"` |
+
+Unsupported levels are not forwarded. Other models keep their existing gateway-selected reasoning behavior.
+
+## Verify
 
 ```console
 pi --list-models commandcode
-pi --model commandcode/deepseek/deepseek-v4-flash -p "reply with exactly: pong"
+pi --model commandcode/deepseek/deepseek-v4-pro --thinking high -p "reply exactly: high-ok"
+pi --model commandcode/deepseek/deepseek-v4-pro --thinking max -p "reply exactly: max-ok"
 ```
 
-If that model id is gone, use another from the list.
+Model availability can change; use another model returned by `--list-models` if necessary. On Pi 0.84.x, `pi auth check --provider commandcode` may report `not_ready` even when generation works.
 
-On Pi 0.84.x, `pi auth check --provider commandcode` said `not_ready` even when generate worked. Skip it.
-
-## Remove
+## Update and Remove
 
 ```console
-pi remove git:github.com/safzanpirani/pi-commandcode-provider
+pi update git:github.com/gonegirl07/commandcode-go-for-pi
+pi remove git:github.com/gonegirl07/commandcode-go-for-pi
 ```
 
-Then delete the `commandcode` entry from `auth.json` if you want the key gone.
+Removing the package does not delete the `commandcode` credential from `auth.json`.
 
-Setup issues: this repo. Extension / protocol: upstream. Account and billing: Command Code.
+## Development
+
+```console
+npm install --include=dev
+npm test
+npm run check
+```
+
+Tests capture the actual serialized request body and verify that reasoning fields never leak to unsupported levels or unrelated models.
 
 ## License
 

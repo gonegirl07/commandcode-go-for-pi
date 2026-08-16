@@ -1,0 +1,36 @@
+{
+  "name": "commandcode-go-for-pi",
+  "version": "0.1.0",
+  "description": "A single Pi extension for using a Command Code Go plan with verified reasoning controls.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gonegirl07/commandcode-go-for-pi.git"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.84.2 <1",
+    "@earendil-works/pi-coding-agent": ">=0.84.2 <1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.0",
+    "typescript": "^5.9.2"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.mjs"
+  }
+}
