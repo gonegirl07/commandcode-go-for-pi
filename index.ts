@@ -42,10 +42,14 @@ import {
 	calculateCost,
 	createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 const BASE_URL = "https://api.commandcode.ai";
 const ENDPOINT = "/alpha/generate";
+const PROVIDER_MODELS_ENDPOINT = "/provider/v1/models";
+const STARTUP_MODEL_FETCH_TIMEOUT_MS = 3_000;
+const BILLING_TIMEOUT_MS = 10_000;
+const RAW_PREVIEW = 280;
 // Mirrors the `x-command-code-version` the CLI sends (its package version).
 // Keep in step with the installed `command-code` package; stale values risk
 // being rejected or flagged by the gateway.
@@ -53,13 +57,11 @@ const COMMAND_CODE_VERSION = "0.52.1";
 
 // ---- Models -------------------------------------------------------------
 // IDs are the gateway's canonical ids from GET /provider/v1/models
-// (readable with a user_... key as of CLI 0.52.x).
+// (publicly readable as of CLI 0.52.x).
 //
-// Only the open-weight / OSS roster is exposed here. Command Code also serves
-// proprietary frontier models (claude-*, gpt-*, google/gemini-*) through the
-// same /alpha/generate envelope, but they bill real plan credits and are
-// available far more cheaply elsewhere, so they're intentionally omitted.
-// To add one, append a ModelDef with the canonical id from the models list.
+// The bundled fallback mirrors the public provider catalog so Pi can list
+// models even when startup is offline. Refresh it from the endpoint or with
+// `cmd --list-models` when Command Code changes the registry.
 //
 // The Go plan ($1/mo, $10 credits) has usage multipliers on some OSS models
 // (e.g. mimo-v2.5 is ~10x, mimo-v2.5-pro ~5x, deepseek-v4-pro ~4x,
@@ -83,6 +85,74 @@ type ModelDef = {
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
+type ProviderModelRow = {
+	id?: unknown;
+	name?: unknown;
+	context_length?: unknown;
+};
+
+const IMAGE_MODEL_IDS = new Set([
+	"deepseek/deepseek-v4-flash-vision-exp",
+	"moonshotai/Kimi-K3",
+	"moonshotai/Kimi-K2.7-Code",
+	"moonshotai/Kimi-K2.7-Code-Highspeed",
+	"moonshotai/Kimi-K2.6",
+	"moonshotai/Kimi-K2.5",
+	"MiniMaxAI/MiniMax-M3",
+	"Qwen/Qwen3.8-27B",
+	"stepfun/Step-3.7-Flash",
+	"thinkingmachines/inkling",
+]);
+
+const REASONING_MODEL_IDS = new Set([
+	"claude-sonnet-5",
+	"claude-fable-5-1",
+	"claude-fable-5",
+	"claude-opus-5",
+	"claude-opus-4-8",
+	"claude-opus-4-7",
+	"gpt-5.6-sol",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna",
+	"gpt-5.5",
+	"gpt-5.4",
+	"gpt-5.3-codex",
+	"deepseek/deepseek-v4-pro",
+	"deepseek/deepseek-v4-flash",
+	"deepseek/deepseek-v4-flash-vision-exp",
+	"deepseek/deepseek-v4.1-flash",
+	"moonshotai/Kimi-K3",
+	"moonshotai/Kimi-K2.7-Code",
+	"moonshotai/Kimi-K2.7-Code-Highspeed",
+	"z-ai/glm-5.3-flash",
+	"zai-org/GLM-5.3",
+	"zai-org/GLM-5.2",
+	"zai-org/GLM-5.1",
+	"zai-org/GLM-5",
+	"MiniMaxAI/MiniMax-M3",
+	"MiniMaxAI/MiniMax-M2.7",
+	"MiniMaxAI/MiniMax-M2.5",
+	"xiaomi/mimo-v2.5-pro",
+	"xiaomi/mimo-v2.5",
+	"Qwen/Qwen3.8-Max-0902",
+	"Qwen/Qwen3.8-Max",
+	"Qwen/Qwen3.8-27B",
+	"Qwen/Qwen3.8-Flash",
+	"Qwen/Qwen3.7-Max",
+	"Qwen/Qwen3.7-Plus",
+	"Qwen/Qwen3.7-Flash",
+	"Qwen/Qwen3.6-Plus",
+	"stepfun/Step-3.7-Flash",
+	"stepfun/Step-3.5-Flash",
+	"tencent/hy3-paid",
+	"tencent/hy4-preview",
+	"nvidia/nemotron-3-ultra-550b-a55b",
+	"thinkingmachines/inkling",
+	"thinkingmachines/inkling-small",
+	"xai/grok-4.5",
+	"xai/grok-4.6",
+]);
+
 const DEEPSEEK_V4_THINKING_LEVEL_MAP = {
 	minimal: null,
 	low: null,
@@ -92,245 +162,145 @@ const DEEPSEEK_V4_THINKING_LEVEL_MAP = {
 	max: "max",
 } satisfies NonNullable<ModelDef["thinkingLevelMap"]>;
 
-const MODELS: ModelDef[] = [
-	// DeepSeek
-	{
-		id: "deepseek/deepseek-v4-pro",
-		name: "DeepSeek V4 Pro (Command Code)",
-		reasoning: true,
-		thinkingLevelMap: DEEPSEEK_V4_THINKING_LEVEL_MAP,
-		input: ["text"],
-		contextWindow: 1_000_000,
-		maxTokens: 131072,
-		cost: ZERO_COST,
-	},
-	{
-		id: "deepseek/deepseek-v4-flash",
-		name: "DeepSeek V4 Flash (Command Code)",
-		reasoning: true,
-		thinkingLevelMap: DEEPSEEK_V4_THINKING_LEVEL_MAP,
-		input: ["text"],
-		contextWindow: 1_000_000,
-		maxTokens: 131072,
-		cost: ZERO_COST,
-	},
-	// Moonshot Kimi
-	{
-		id: "moonshotai/Kimi-K3",
-		name: "Kimi K3 (Command Code)",
-		reasoning: true,
-		input: ["text", "image"],
-		contextWindow: 1_000_000,
-		maxTokens: 65_536,
-		cost: ZERO_COST,
-	},
-	{
-		id: "moonshotai/Kimi-K2.7-Code",
-		name: "Kimi K2.7 Code (Command Code)",
-		reasoning: true,
-		input: ["text", "image"],
-		contextWindow: 256000,
-		maxTokens: 65536,
-		cost: ZERO_COST,
-	},
-	{
-		id: "moonshotai/Kimi-K2.7-Code-Highspeed",
-		name: "Kimi K2.7 Code HighSpeed (Command Code)",
-		reasoning: true,
-		input: ["text", "image"],
-		contextWindow: 262000,
-		maxTokens: 65536,
-		cost: ZERO_COST,
-	},
-	{
-		id: "moonshotai/Kimi-K2.6",
-		name: "Kimi K2.6 (Command Code)",
-		reasoning: false,
-		input: ["text", "image"],
-		contextWindow: 256000,
-		maxTokens: 65536,
-		cost: ZERO_COST,
-	},
-	{
-		id: "moonshotai/Kimi-K2.5",
-		name: "Kimi K2.5 (Command Code)",
-		reasoning: false,
-		input: ["text", "image"],
-		contextWindow: 256000,
-		maxTokens: 65536,
-		cost: ZERO_COST,
-	},
-	// Zhipu GLM
-	{
-		id: "zai-org/GLM-5.2",
-		name: "GLM 5.2 (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 1_000_000,
-		maxTokens: 131072,
-		cost: ZERO_COST,
-	},
-	{
-		id: "zai-org/GLM-5.2-Fast",
-		name: "GLM 5.2 Fast (Command Code)",
-		reasoning: false,
-		input: ["text"],
-		contextWindow: 1_000_000,
-		maxTokens: 65_536,
-		cost: ZERO_COST,
-	},
-	{
-		id: "zai-org/GLM-5.1",
-		name: "GLM 5.1 (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 200000,
-		maxTokens: 32768,
-		cost: ZERO_COST,
-	},
-	{
-		id: "zai-org/GLM-5",
-		name: "GLM 5 (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 200000,
-		maxTokens: 32768,
-		cost: ZERO_COST,
-	},
-	// MiniMax
-	{
-		id: "MiniMaxAI/MiniMax-M3",
-		name: "MiniMax M3 (Command Code)",
-		reasoning: true,
-		input: ["text", "image"],
-		contextWindow: 1_000_000,
-		maxTokens: 131072,
-		cost: ZERO_COST,
-	},
-	{
-		id: "MiniMaxAI/MiniMax-M2.7",
-		name: "MiniMax M2.7 (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 200000,
-		maxTokens: 65536,
-		cost: ZERO_COST,
-	},
-	{
-		id: "MiniMaxAI/MiniMax-M2.5",
-		name: "MiniMax M2.5 (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 200000,
-		maxTokens: 65536,
-		cost: ZERO_COST,
-	},
-	// Xiaomi MiMo
-	{
-		id: "xiaomi/mimo-v2.5-pro",
-		name: "MiMo V2.5 Pro (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 1_000_000,
-		maxTokens: 131072,
-		cost: ZERO_COST,
-	},
-	{
-		id: "xiaomi/mimo-v2.5",
-		name: "MiMo V2.5 (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 1_000_000,
-		maxTokens: 131072,
-		cost: ZERO_COST,
-	},
-	// Qwen
-	{
-		id: "Qwen/Qwen3.7-Max",
-		name: "Qwen 3.7 Max (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 1_000_000,
-		maxTokens: 131072,
-		cost: ZERO_COST,
-	},
-	{
-		id: "Qwen/Qwen3.7-Plus",
-		name: "Qwen 3.7 Plus (Command Code)",
-		reasoning: true,
-		input: ["text", "image"],
-		contextWindow: 1_000_000,
-		maxTokens: 131072,
-		cost: ZERO_COST,
-	},
-	{
-		id: "Qwen/Qwen3.6-Max-Preview",
-		name: "Qwen 3.6 Max Preview (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 200000,
-		maxTokens: 32768,
-		cost: ZERO_COST,
-	},
-	{
-		id: "Qwen/Qwen3.6-Plus",
-		name: "Qwen 3.6 Plus (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 200000,
-		maxTokens: 32768,
-		cost: ZERO_COST,
-	},
-	// StepFun
-	{
-		id: "stepfun/Step-3.7-Flash",
-		name: "Step 3.7 Flash (Command Code)",
-		reasoning: true,
-		input: ["text", "image"],
-		contextWindow: 256000,
-		maxTokens: 65536,
-		cost: ZERO_COST,
-	},
-	{
-		id: "stepfun/Step-3.5-Flash",
-		name: "Step 3.5 Flash (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 1_000_000,
-		maxTokens: 131072,
-		cost: ZERO_COST,
-	},
-	// Tencent
-	{
-		id: "tencent/Hy3",
-		name: "Tencent Hy3 (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 262_144,
-		maxTokens: 65_536,
-		cost: ZERO_COST,
-	},
-	// NVIDIA
-	{
-		id: "nvidia/nemotron-3-ultra-550b-a55b",
-		name: "Nemotron 3 Ultra (Command Code)",
-		reasoning: true,
-		input: ["text"],
-		contextWindow: 1_000_000,
-		maxTokens: 131072,
-		cost: ZERO_COST,
-	},
-	// Thinking Machines
-	{
-		id: "thinkingmachines/inkling",
-		name: "Inkling (Command Code)",
-		reasoning: true,
-		input: ["text", "image"],
-		contextWindow: 256_000,
-		maxTokens: 65_536,
-		cost: ZERO_COST,
-	},
-];
+function modelInput(id: string): ModelDef["input"] {
+	return IMAGE_MODEL_IDS.has(id) ? ["text", "image"] : ["text"];
+}
+
+function modelThinkingLevelMap(id: string): ModelDef["thinkingLevelMap"] | undefined {
+	return id === "deepseek/deepseek-v4-pro" || id === "deepseek/deepseek-v4-flash"
+		? DEEPSEEK_V4_THINKING_LEVEL_MAP
+		: undefined;
+}
+
+export function parseProviderModels(data: unknown): ModelDef[] {
+	if (!data || typeof data !== "object") return [];
+	const rows = Array.isArray((data as { data?: unknown }).data) ? (data as { data: unknown[] }).data : [];
+	const models: ModelDef[] = [];
+	for (const row of rows as ProviderModelRow[]) {
+		if (!row || typeof row !== "object") continue;
+		const id = row.id;
+		const name = row.name;
+		const contextWindow = row.context_length;
+		if (typeof id !== "string" || typeof name !== "string" || typeof contextWindow !== "number") {
+			continue;
+		}
+		models.push({
+			id,
+			name: `${name} (Command Code)`,
+			reasoning: REASONING_MODEL_IDS.has(id),
+			thinkingLevelMap: modelThinkingLevelMap(id),
+			input: modelInput(id),
+			contextWindow,
+			maxTokens: Math.min(contextWindow, 131_072),
+			cost: ZERO_COST,
+		});
+	}
+	return models;
+}
+
+async function fetchProviderModels(signal?: AbortSignal): Promise<ModelDef[]> {
+	const response = await fetch(`${BASE_URL}${PROVIDER_MODELS_ENDPOINT}`, {
+		headers: { Accept: "application/json" },
+		signal,
+	});
+	if (!response.ok) throw new Error(`Command Code models ${response.status}: ${response.statusText}`);
+	const models = parseProviderModels(await response.json());
+	if (models.length === 0) throw new Error("Command Code models endpoint returned no usable models");
+	return models;
+}
+
+export async function fetchProviderModelsWithTimeout(
+	timeoutMs = STARTUP_MODEL_FETCH_TIMEOUT_MS,
+): Promise<ModelDef[]> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		return await fetchProviderModels(controller.signal);
+	} catch (error) {
+		if (error instanceof Error && error.name === "AbortError") {
+			throw new Error("Command Code model catalog fetch timed out");
+		}
+		throw error;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+const FALLBACK_PROVIDER_MODELS = {
+	data: [
+		{ id: "claude-sonnet-5", name: "Claude Sonnet 5", context_length: 1000000 },
+		{ id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", context_length: 1000000 },
+		{ id: "claude-fable-5-1", name: "Claude Fable 5.1", context_length: 1000000 },
+		{ id: "claude-fable-5", name: "Claude Fable 5", context_length: 1000000 },
+		{ id: "claude-opus-5", name: "Claude Opus 5", context_length: 1000000 },
+		{ id: "claude-opus-4-8", name: "Claude Opus 4.8", context_length: 1000000 },
+		{ id: "claude-opus-4-7", name: "Claude Opus 4.7", context_length: 1000000 },
+		{ id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", context_length: 200000 },
+		{ id: "gpt-5.6-sol", name: "GPT-5.6 Sol", context_length: 1050000 },
+		{ id: "gpt-5.6-terra", name: "GPT-5.6 Terra", context_length: 1050000 },
+		{ id: "gpt-5.6-luna", name: "GPT-5.6 Luna", context_length: 1050000 },
+		{ id: "gpt-5.5", name: "GPT-5.5", context_length: 400000 },
+		{ id: "gpt-5.4", name: "GPT-5.4", context_length: 400000 },
+		{ id: "gpt-5.3-codex", name: "GPT-5.3 Codex", context_length: 400000 },
+		{ id: "gpt-5.4-mini", name: "GPT-5.4 Mini", context_length: 400000 },
+		{ id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro (latest)", context_length: 1000000 },
+		{ id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash (latest)", context_length: 1000000 },
+		{ id: "deepseek/deepseek-v4-flash-vision-exp", name: "DeepSeek V4 Flash Vision (exp)", context_length: 1000000 },
+		{ id: "deepseek/deepseek-v4-flash-fast", name: "DeepSeek V4 Flash Fast", context_length: 1000000 },
+		{ id: "deepseek/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash", context_length: 1000000 },
+		{ id: "moonshotai/Kimi-K3", name: "Kimi K3", context_length: 1000000 },
+		{ id: "moonshotai/Kimi-K2.7-Code", name: "Kimi K2.7 Code", context_length: 256000 },
+		{ id: "moonshotai/Kimi-K2.7-Code-Highspeed", name: "Kimi K2.7 Code HighSpeed", context_length: 262000 },
+		{ id: "moonshotai/Kimi-K2.6", name: "Kimi K2.6", context_length: 256000 },
+		{ id: "moonshotai/Kimi-K2.5", name: "Kimi K2.5", context_length: 256000 },
+		{ id: "z-ai/glm-5.3-flash", name: "GLM-5.3 Flash", context_length: 1048576 },
+		{ id: "zai-org/GLM-5.3", name: "GLM-5.3", context_length: 1000000 },
+		{ id: "zai-org/GLM-5.2", name: "GLM-5.2", context_length: 1000000 },
+		{ id: "zai-org/GLM-5.2-Fast", name: "GLM-5.2 Fast", context_length: 1000000 },
+		{ id: "zai-org/GLM-5.1", name: "GLM-5.1", context_length: 200000 },
+		{ id: "zai-org/GLM-5", name: "GLM-5", context_length: 200000 },
+		{ id: "MiniMaxAI/MiniMax-M3", name: "MiniMax M3", context_length: 1000000 },
+		{ id: "MiniMaxAI/MiniMax-M2.7", name: "MiniMax M2.7", context_length: 200000 },
+		{ id: "MiniMaxAI/MiniMax-M2.5", name: "MiniMax M2.5", context_length: 200000 },
+		{ id: "xiaomi/mimo-v2.5-pro", name: "MiMo V2.5 Pro", context_length: 1000000 },
+		{ id: "xiaomi/mimo-v2.5", name: "MiMo V2.5", context_length: 1000000 },
+		{ id: "Qwen/Qwen3.8-Max-0902", name: "Qwen 3.8 Max 0902", context_length: 1000000 },
+		{ id: "Qwen/Qwen3.8-Max", name: "Qwen 3.8 Max", context_length: 1000000 },
+		{ id: "Qwen/Qwen3.8-27B", name: "Qwen 3.8 27B", context_length: 262144 },
+		{ id: "Qwen/Qwen3.8-Flash", name: "Qwen 3.8 Flash", context_length: 1000000 },
+		{ id: "Qwen/Qwen3.7-Max", name: "Qwen 3.7 Max", context_length: 1000000 },
+		{ id: "Qwen/Qwen3.7-Plus", name: "Qwen 3.7 Plus", context_length: 1000000 },
+		{ id: "Qwen/Qwen3.7-Flash", name: "Qwen 3.7 Flash", context_length: 1000000 },
+		{ id: "Qwen/Qwen3.6-Max-Preview", name: "Qwen 3.6 Max Preview", context_length: 200000 },
+		{ id: "Qwen/Qwen3.6-Plus", name: "Qwen 3.6 Plus", context_length: 200000 },
+		{ id: "meituan/LongCat-2.0:free", name: "LongCat 2.0", context_length: 1048576 },
+		{ id: "stepfun/Step-3.7-Flash", name: "Step 3.7 Flash", context_length: 256000 },
+		{ id: "stepfun/Step-3.5-Flash", name: "Step 3.5 Flash", context_length: 1000000 },
+		{ id: "tencent/hy3-paid", name: "Tencent Hy3", context_length: 262144 },
+		{ id: "tencent/hy4-preview", name: "Tencent Hy4 Preview", context_length: 1048576 },
+		{ id: "google/gemini-3.8-flash", name: "Gemini 3.8 Flash", context_length: 1000000 },
+		{ id: "google/gemini-3.7-flash", name: "Gemini 3.7 Flash", context_length: 1048576 },
+		{ id: "google/gemini-3.6-flash", name: "Gemini 3.6 Flash", context_length: 1000000 },
+		{ id: "google/gemini-3.5-flash", name: "Gemini 3.5 Flash", context_length: 1000000 },
+		{ id: "google/gemini-3.5-flash-lite", name: "Gemini 3.5 Flash Lite", context_length: 1000000 },
+		{ id: "google/gemini-3.1-flash-lite", name: "Gemini 3.1 Flash Lite", context_length: 1000000 },
+		{ id: "sakana/fugu-ultra", name: "Fugu Ultra", context_length: 1000000 },
+		{ id: "nvidia/nemotron-3-ultra-550b-a55b", name: "Nemotron 3 Ultra", context_length: 1000000 },
+		{ id: "thinkingmachines/inkling", name: "Inkling", context_length: 256000 },
+		{ id: "thinkingmachines/inkling-small", name: "Inkling Small", context_length: 1000000 },
+		{ id: "poolside/laguna-s-2.1-free", name: "Laguna S 2.1", context_length: 256000 },
+		{ id: "inclusionai/ling-3.0-flash-sante:free", name: "Ling 3.0 Flash Sante", context_length: 262144 },
+		{ id: "meta/muse-spark-1.1", name: "Muse Spark 1.1", context_length: 1048576 },
+		{ id: "meta/muse-spark-1.2", name: "Muse Spark 1.2", context_length: 1048576 },
+		{ id: "meta/muse-spark-1.2-contributor", name: "Muse Spark 1.2 Contributor", context_length: 1048576 },
+		{ id: "meta/muse-spark-1.3", name: "Muse Spark 1.3", context_length: 1048576 },
+		{ id: "meta/muse-spark-1.3-contributor", name: "Muse Spark 1.3 Contributor", context_length: 1048576 },
+		{ id: "xai/grok-4.5", name: "Grok 4.5", context_length: 500000 },
+		{ id: "xai/grok-4.6", name: "Grok 4.6", context_length: 500000 },
+	],
+};
+
+const MODELS: ModelDef[] = parseProviderModels(FALLBACK_PROVIDER_MODELS);
 
 // ---- Message conversion -------------------------------------------------
 //
@@ -826,9 +796,278 @@ function streamCommandCode(
 	return stream;
 }
 
+// ---- /cc-usage -----------------------------------------------------------
+
+type WindowUsage = {
+	used: number;
+	cap: number;
+	exceeded: boolean;
+	resetAt: number;
+};
+
+type CreditsSnapshot = {
+	monthlyCredits: number;
+	purchasedCredits: number;
+	freeCredits: number;
+	belowThreshold: boolean;
+	limited: boolean;
+	fiveHour?: WindowUsage;
+	weekly?: WindowUsage;
+};
+
+type SubscriptionSnapshot = {
+	planId?: string;
+	status?: string;
+	currentPeriodEnd?: string;
+};
+
+type FetchResult =
+	| { ok: true; data: unknown }
+	| { ok: false; error: string; status?: number; raw?: string };
+
+const MONTHLY_ALLOWANCE: Record<string, number> = {
+	"individual-go": 10,
+	"individual-goat": 70,
+	"individual-pro": 80,
+	"individual-max": 150,
+	"individual-max-10x": 150,
+	"individual-max-20x": 300,
+};
+
+function asFiniteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function parseWindow(value: unknown): WindowUsage | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const row = value as Record<string, unknown>;
+	const used = asFiniteNumber(row.used);
+	const cap = asFiniteNumber(row.cap);
+	const resetAt = asFiniteNumber(row.resetAt);
+	if (used === undefined || cap === undefined || resetAt === undefined) return undefined;
+	return { used, cap, exceeded: row.exceeded === true, resetAt };
+}
+
+export function parseCredits(data: unknown): CreditsSnapshot | undefined {
+	if (!data || typeof data !== "object") return undefined;
+	const root = data as Record<string, unknown>;
+	if (!root.credits || typeof root.credits !== "object") return undefined;
+	const credits = root.credits as Record<string, unknown>;
+	const monthlyCredits = asFiniteNumber(credits.monthlyCredits);
+	if (monthlyCredits === undefined) return undefined;
+
+	const windows =
+		root.windowLimits && typeof root.windowLimits === "object"
+			? (root.windowLimits as Record<string, unknown>)
+			: undefined;
+
+	return {
+		monthlyCredits,
+		purchasedCredits: asFiniteNumber(credits.purchasedCredits) ?? 0,
+		freeCredits: asFiniteNumber(credits.freeCredits) ?? 0,
+		belowThreshold: credits.belowThreshold === true,
+		limited: windows?.limited === true,
+		fiveHour: windows ? parseWindow(windows.fiveHour) : undefined,
+		weekly: windows ? parseWindow(windows.weekly) : undefined,
+	};
+}
+
+export function parseSubscription(data: unknown): SubscriptionSnapshot | undefined {
+	if (!data || typeof data !== "object") return undefined;
+	const root = data as Record<string, unknown>;
+	if (!root.data || typeof root.data !== "object") return undefined;
+	const row = root.data as Record<string, unknown>;
+	const planId = typeof row.planId === "string" ? row.planId : undefined;
+	const status = typeof row.status === "string" ? row.status : undefined;
+	const currentPeriodEnd = typeof row.currentPeriodEnd === "string" ? row.currentPeriodEnd : undefined;
+	if (!planId && !status && !currentPeriodEnd) return undefined;
+	return { planId, status, currentPeriodEnd };
+}
+
+function usd(amount: number, compact = false): string {
+	if (compact && Number.isInteger(amount)) return `$${amount}`;
+	return `$${amount.toFixed(2)}`;
+}
+
+function formatReset(resetAt: number): string {
+	return new Date(resetAt).toLocaleString("en-US", {
+		month: "short",
+		day: "numeric",
+		hour: "2-digit",
+		minute: "2-digit",
+		hour12: false,
+	});
+}
+
+function formatCycleEnd(iso: string): string {
+	return new Date(iso).toLocaleDateString("en-US", {
+		month: "short",
+		day: "numeric",
+		year: "numeric",
+	});
+}
+
+function formatWindow(label: string, window: WindowUsage): string {
+	const reset = formatReset(window.resetAt);
+	const suffix = window.exceeded ? "exceeded, reset" : "reset";
+	return `${label.padEnd(7)}  ${usd(window.used)} / ${usd(window.cap, true)}    ${suffix} ${reset}`;
+}
+
+export function formatReport(
+	credits: CreditsSnapshot,
+	subscription: SubscriptionSnapshot | undefined,
+	subscriptionError: string | undefined,
+): string {
+	const lines: string[] = [];
+	const headerBits = ["Command Code", subscription?.planId];
+	if (subscription?.status && subscription.status !== "active") {
+		headerBits.push(`(${subscription.status})`);
+	}
+	lines.push(headerBits.filter(Boolean).join("  "));
+
+	const monthlyCap = subscription?.planId ? MONTHLY_ALLOWANCE[subscription.planId] : undefined;
+	const month =
+		monthlyCap !== undefined
+			? `${usd(credits.monthlyCredits)} / ${usd(monthlyCap, true)} left`
+			: `${usd(credits.monthlyCredits)} left`;
+	lines.push(`${"Month".padEnd(7)}  ${month}`);
+
+	if (credits.purchasedCredits > 0 || credits.freeCredits > 0) {
+		const extras: string[] = [];
+		if (credits.purchasedCredits > 0) extras.push(`${usd(credits.purchasedCredits)} purchased`);
+		if (credits.freeCredits > 0) extras.push(`${usd(credits.freeCredits)} free`);
+		lines.push(`${"Extra".padEnd(7)}  ${extras.join(" + ")}`);
+	}
+
+	if (credits.limited) {
+		if (credits.fiveHour) lines.push(formatWindow("5-hour", credits.fiveHour));
+		if (credits.weekly) lines.push(formatWindow("Week", credits.weekly));
+	}
+
+	if (subscription?.currentPeriodEnd) {
+		lines.push(`${"Cycle".padEnd(7)}  ends ${formatCycleEnd(subscription.currentPeriodEnd)}`);
+	} else if (subscriptionError) {
+		lines.push(`${"Cycle".padEnd(7)}  unavailable (${subscriptionError})`);
+	}
+
+	return lines.join("\n");
+}
+
+function previewRaw(raw: string | undefined): string {
+	if (!raw) return "";
+	const compact = raw.replace(/\s+/g, " ").trim();
+	return compact.length <= RAW_PREVIEW ? compact : `${compact.slice(0, RAW_PREVIEW)}...`;
+}
+
+async function getJson(path: string, apiKey: string): Promise<FetchResult> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), BILLING_TIMEOUT_MS);
+	try {
+		const response = await fetch(`${BASE_URL}${path}`, {
+			headers: {
+				Authorization: `Bearer ${apiKey}`,
+				Accept: "application/json",
+			},
+			signal: controller.signal,
+		});
+		const raw = await response.text();
+		if (response.status === 401) {
+			return { ok: false, error: "Unauthorized. Check the Command Code API key.", status: 401, raw };
+		}
+		if (response.status === 429) {
+			return { ok: false, error: "Rate limited. Try again later.", status: 429, raw };
+		}
+		if (response.status >= 500) {
+			return {
+				ok: false,
+				error: `Command Code billing API unavailable (HTTP ${response.status}).`,
+				status: response.status,
+				raw,
+			};
+		}
+		if (!response.ok) {
+			return {
+				ok: false,
+				error: `Command Code billing API failed (HTTP ${response.status}).`,
+				status: response.status,
+				raw,
+			};
+		}
+		try {
+			return { ok: true, data: JSON.parse(raw) };
+		} catch {
+			return { ok: false, error: "Billing API returned non-JSON.", raw };
+		}
+	} catch (error) {
+		if (error instanceof Error && error.name === "AbortError") {
+			return { ok: false, error: "Command Code billing API timed out." };
+		}
+		return { ok: false, error: "Command Code billing API request failed." };
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+async function resolveUsageApiKey(ctx: ExtensionCommandContext): Promise<string | undefined> {
+	const fromRegistry = await ctx.modelRegistry.getApiKeyForProvider("commandcode");
+	if (fromRegistry) return fromRegistry;
+	const fromEnv = process.env.COMMANDCODE_API_KEY;
+	return fromEnv && fromEnv.length > 0 ? fromEnv : undefined;
+}
+
+async function runUsage(_args: string, ctx: ExtensionCommandContext): Promise<void> {
+	const apiKey = await resolveUsageApiKey(ctx);
+	if (!apiKey) {
+		ctx.ui.notify(
+			"No Command Code API key. Add a commandcode api_key entry to ~/.pi/agent/auth.json, or set COMMANDCODE_API_KEY.",
+			"error",
+		);
+		return;
+	}
+
+	const [creditsResult, subscriptionResult] = await Promise.all([
+		getJson("/alpha/billing/credits", apiKey),
+		getJson("/alpha/billing/subscriptions", apiKey),
+	]);
+
+	if (!creditsResult.ok) {
+		ctx.ui.notify(creditsResult.error, "error");
+		return;
+	}
+
+	const credits = parseCredits(creditsResult.data);
+	if (!credits) {
+		const snippet = previewRaw(JSON.stringify(creditsResult.data));
+		ctx.ui.notify(`Billing API changed shape. ${snippet}`.trim(), "error");
+		return;
+	}
+
+	let subscription: SubscriptionSnapshot | undefined;
+	let subscriptionError: string | undefined;
+	if (subscriptionResult.ok) {
+		subscription = parseSubscription(subscriptionResult.data);
+		if (!subscription) subscriptionError = "changed shape";
+	} else {
+		subscriptionError = subscriptionResult.error;
+	}
+
+	const report = formatReport(credits, subscription, subscriptionError);
+	const kind = credits.belowThreshold || credits.fiveHour?.exceeded || credits.weekly?.exceeded ? "warning" : "info";
+	ctx.ui.notify(report, kind);
+}
+
 // ---- Extension entry point ----------------------------------------------
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
+	let models = MODELS;
+	try {
+		models = await fetchProviderModelsWithTimeout();
+	} catch (error) {
+		if (process.env.DEBUG) {
+			console.error("[commandcode] model catalog refresh failed:", error);
+		}
+	}
+
 	pi.registerProvider("commandcode", {
 		name: "Command Code",
 		baseUrl: BASE_URL,
@@ -836,6 +1075,14 @@ export default function (pi: ExtensionAPI) {
 		authHeader: true,
 		api: "commandcode-generate",
 		streamSimple: streamCommandCode,
-		models: MODELS,
+		models,
+		async refreshModels(context) {
+			if (!context.allowNetwork) return MODELS;
+			return fetchProviderModels(context.signal);
+		},
+	});
+	pi.registerCommand("cc-usage", {
+		description: "Show Command Code plan credits and usage limits",
+		handler: runUsage,
 	});
 }

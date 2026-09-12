@@ -1,13 +1,40 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import registerCommandCode from "../index.ts";
+import registerCommandCode, {
+	fetchProviderModelsWithTimeout,
+	formatReport,
+	parseCredits,
+	parseProviderModels,
+	parseSubscription,
+} from "../index.ts";
 
 let provider;
-registerCommandCode({
+let commands;
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (input, init) => {
+	if (String(input).includes("/provider/v1/models")) {
+		return new Response(
+			JSON.stringify({
+				data: [
+					{ id: "claude-sonnet-5", name: "Claude Sonnet 5", context_length: 1_000_000 },
+					{ id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro (latest)", context_length: 1_000_000 },
+					{ id: "moonshotai/Kimi-K3", name: "Kimi K3", context_length: 1_000_000 },
+				],
+			}),
+			{ status: 200 },
+		);
+	}
+	return realFetch(input, init);
+};
+await registerCommandCode({
 	registerProvider(name, config) {
 		assert.equal(name, "commandcode");
 		provider = config;
+	},
+	registerCommand(name, config) {
+		commands ??= new Map();
+		commands.set(name, config);
 	},
 });
 
@@ -28,6 +55,78 @@ test("registers a self-contained Command Code provider", () => {
 	assert.equal(provider.api, "commandcode-generate");
 	assert.equal(provider.streamSimple instanceof Function, true);
 	assert.ok(provider.models.some((model) => model.id === "deepseek/deepseek-v4-pro"));
+});
+
+test("registers the Command Code usage command in the same extension", () => {
+	assert.equal(commands.get("cc-usage")?.handler instanceof Function, true);
+});
+
+test("parses provider models from Command Code's public catalog shape", () => {
+	const models = parseProviderModels({
+		data: [
+			{
+				id: "claude-sonnet-5",
+				name: "Claude Sonnet 5",
+				context_length: 1_000_000,
+			},
+			{
+				id: "deepseek/deepseek-v4-flash-vision-exp",
+				name: "DeepSeek V4 Flash Vision (exp)",
+				context_length: 1_000_000,
+			},
+			{
+				id: "bad-model",
+				name: "Bad",
+				context_length: "unknown",
+			},
+		],
+	});
+
+	assert.deepEqual(
+		models.map((model) => [model.id, model.reasoning, model.input]),
+		[
+			["claude-sonnet-5", true, ["text"]],
+			["deepseek/deepseek-v4-flash-vision-exp", true, ["text", "image"]],
+		],
+	);
+	assert.ok(models.some((model) => model.id === "claude-sonnet-5"));
+});
+
+test("refreshes provider models from Command Code's public catalog", async (t) => {
+	t.mock.method(globalThis, "fetch", async () => {
+		return new Response(
+			JSON.stringify({
+				data: [
+					{
+						id: "xai/grok-4.6",
+						name: "Grok 4.6",
+						context_length: 500_000,
+					},
+				],
+			}),
+			{ status: 200 },
+		);
+	});
+
+	const refreshed = await provider.refreshModels({
+		allowNetwork: true,
+		signal: new AbortController().signal,
+	});
+
+	assert.deepEqual(
+		refreshed.map((model) => model.id),
+		["xai/grok-4.6"],
+	);
+});
+
+test("times out startup model catalog fetches", async (t) => {
+	t.mock.method(globalThis, "fetch", async (_input, init) => {
+		return new Promise((_resolve, reject) => {
+			init.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+		});
+	});
+
+	await assert.rejects(() => fetchProviderModelsWithTimeout(10), /timed out/);
 });
 
 test("forwards supported DeepSeek effort levels to alpha/generate", async (t) => {
@@ -113,4 +212,29 @@ test("resolves Pi's literal Command Code environment-key references", async (t) 
 	}
 
 	assert.deepEqual(authorizationHeaders, ["Bearer user_env_test", "Bearer user_env_test"]);
+});
+
+test("formats GOAT usage reports", () => {
+	const credits = parseCredits({
+		credits: { monthlyCredits: 62.5, purchasedCredits: 1, freeCredits: 0, belowThreshold: false },
+		windowLimits: {
+			limited: true,
+			fiveHour: { used: 1, cap: 10, exceeded: false, resetAt: Date.UTC(2026, 8, 12, 7, 0) },
+			weekly: { used: 4, cap: 40, exceeded: false, resetAt: Date.UTC(2026, 8, 15, 7, 0) },
+		},
+	});
+	const subscription = parseSubscription({
+		data: {
+			planId: "individual-goat",
+			status: "active",
+			currentPeriodEnd: "2026-09-30T00:00:00.000Z",
+		},
+	});
+
+	assert.ok(credits);
+	assert.ok(subscription);
+	const report = formatReport(credits, subscription, undefined);
+	assert.match(report, /Command Code  individual-goat/);
+	assert.match(report, /Month\s+\$62\.50 \/ \$70 left/);
+	assert.match(report, /Extra\s+\$1\.00 purchased/);
 });

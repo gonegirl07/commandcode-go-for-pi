@@ -1,12 +1,25 @@
 {
   "name": "commandcode-go-for-pi",
   "version": "0.1.0",
-  "description": "A single Pi extension for using a Command Code Go plan with verified reasoning controls.",
+  "description": "A single Pi extension for Command Code Go/GOAT models, reasoning controls, and usage reporting.",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "commandcode",
+    "go",
+    "goat",
+    "usage"
+  ],
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/gonegirl07/commandcode-go-for-pi.git"
+  },
+  "homepage": "https://github.com/gonegirl07/commandcode-go-for-pi#readme",
+  "bugs": {
+    "url": "https://github.com/gonegirl07/commandcode-go-for-pi/issues"
   },
   "engines": {
     "node": ">=22.19.0"
