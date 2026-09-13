@@ -79,7 +79,22 @@ Unsupported levels are not forwarded. Other reasoning-capable models are marked 
 
 ## Usage
 
-This package includes the former `commandcode-usage-for-pi` command:
+When a Command Code model is selected, a compact usage bar appears directly below the chat input:
+
+```text
+5h ▓▓░░░░░░░░ 18%   Wk ▓░░░░░░░░░  8%   Mo ▓░░░░░░░░░ 11%
+```
+
+| Segment | Meaning |
+| --- | --- |
+| `5h` | Rolling 5-hour usage window |
+| `Wk` | Weekly usage window |
+| `Mo` | Monthly credit allocation |
+| `▓▓░░░░░░░░ 18%` | How much of that window is already used |
+
+Bar color follows the active Pi theme: green below 70% used, yellow 70–90%, red at or above 90%. The line refreshes on startup, when the agent settles, on `/model`, and every 60 seconds while it is shown. Switching to a non-Command Code model hides it. Plans without rolling windows omit those segments instead of inventing numbers. A later billing error keeps the last good line instead of clearing it.
+
+This package also includes the former `commandcode-usage-for-pi` command for a detailed dollar report:
 
 ```console
 /cc-usage
@@ -124,7 +139,7 @@ npm test
 npm run check
 ```
 
-Tests capture the actual serialized request body and verify that reasoning fields never leak to unsupported levels or unrelated models. Catalog tests cover the public provider model shape and `/cc-usage` formatting.
+Tests capture the actual serialized request body and verify that reasoning fields never leak to unsupported levels or unrelated models. Catalog tests cover the public provider model shape, `/cc-usage` formatting, and the compact quota bar below the editor.
 
 ## License
 

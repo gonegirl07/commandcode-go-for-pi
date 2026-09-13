@@ -1,7 +1,7 @@
 {
   "name": "commandcode-go-for-pi",
   "version": "0.1.0",
-  "description": "A single Pi extension for Command Code Go/GOAT models, reasoning controls, and usage reporting.",
+  "description": "A single Pi extension for Command Code Go/GOAT models, reasoning controls, a live quota bar, and usage reporting.",
   "keywords": [
     "pi",
     "pi-package",

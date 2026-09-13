@@ -3,6 +3,7 @@ import test from "node:test";
 
 import registerCommandCode, {
 	fetchProviderModelsWithTimeout,
+	formatQuotaBar,
 	formatReport,
 	parseCredits,
 	parseProviderModels,
@@ -36,6 +37,7 @@ await registerCommandCode({
 		commands ??= new Map();
 		commands.set(name, config);
 	},
+	on() {},
 });
 
 function terminalResponse() {
@@ -237,4 +239,307 @@ test("formats GOAT usage reports", () => {
 	assert.match(report, /Command Code  individual-goat/);
 	assert.match(report, /Month\s+\$62\.50 \/ \$70 left/);
 	assert.match(report, /Extra\s+\$1\.00 purchased/);
+});
+
+function goatCredits(overrides = {}) {
+	return parseCredits({
+		credits: {
+			monthlyCredits: 62.3,
+			purchasedCredits: 0,
+			freeCredits: 0,
+			belowThreshold: false,
+			...overrides.credits,
+		},
+		windowLimits: {
+			limited: true,
+			fiveHour: { used: 1.8, cap: 10, exceeded: false, resetAt: Date.UTC(2026, 8, 12, 7, 0) },
+			weekly: { used: 3.2, cap: 40, exceeded: false, resetAt: Date.UTC(2026, 8, 15, 7, 0) },
+			...overrides.windowLimits,
+		},
+	});
+}
+
+test("formats a compact 5h/weekly/monthly quota bar with percentages", () => {
+	const credits = goatCredits();
+	const subscription = parseSubscription({
+		data: { planId: "individual-goat", status: "active" },
+	});
+
+	assert.ok(credits);
+	assert.equal(
+		formatQuotaBar(credits, subscription),
+		"5h ▓▓░░░░░░░░ 18%   Wk ▓░░░░░░░░░  8%   Mo ▓░░░░░░░░░ 11%",
+	);
+});
+
+test("omits 5-hour and weekly segments when the plan is not window-limited", () => {
+	const credits = parseCredits({
+		credits: { monthlyCredits: 9, purchasedCredits: 0, freeCredits: 0, belowThreshold: false },
+		windowLimits: { limited: false },
+	});
+	const subscription = parseSubscription({
+		data: { planId: "individual-go", status: "active" },
+	});
+
+	assert.ok(credits);
+	assert.equal(formatQuotaBar(credits, subscription), "Mo ▓░░░░░░░░░ 10%");
+});
+
+test("omits the monthly segment when the plan cap is unknown", () => {
+	const credits = parseCredits({
+		credits: { monthlyCredits: 62.3, purchasedCredits: 0, freeCredits: 0, belowThreshold: false },
+		windowLimits: {
+			limited: true,
+			fiveHour: { used: 1, cap: 10, exceeded: false, resetAt: Date.UTC(2026, 8, 12, 7, 0) },
+			weekly: { used: 4, cap: 40, exceeded: false, resetAt: Date.UTC(2026, 8, 15, 7, 0) },
+		},
+	});
+
+	assert.ok(credits);
+	assert.equal(formatQuotaBar(credits, undefined), "5h ▓░░░░░░░░░ 10%   Wk ▓░░░░░░░░░ 10%");
+});
+
+test("clamps an exhausted window to a full 100% bar", () => {
+	const credits = parseCredits({
+		credits: { monthlyCredits: 0, purchasedCredits: 0, freeCredits: 0, belowThreshold: true },
+		windowLimits: {
+			limited: true,
+			fiveHour: { used: 12, cap: 10, exceeded: true, resetAt: Date.UTC(2026, 8, 12, 7, 0) },
+		},
+	});
+	const subscription = parseSubscription({
+		data: { planId: "individual-go", status: "active" },
+	});
+
+	assert.ok(credits);
+	assert.equal(formatQuotaBar(credits, subscription), "5h ▓▓▓▓▓▓▓▓▓▓ 100%   Mo ▓▓▓▓▓▓▓▓▓▓ 100%");
+});
+
+test("colors quota segments by usage threshold", () => {
+	const credits = parseCredits({
+		credits: { monthlyCredits: 7, purchasedCredits: 0, freeCredits: 0, belowThreshold: false },
+		windowLimits: {
+			limited: true,
+			fiveHour: { used: 8, cap: 10, exceeded: false, resetAt: Date.UTC(2026, 8, 12, 7, 0) },
+			weekly: { used: 36, cap: 40, exceeded: false, resetAt: Date.UTC(2026, 8, 15, 7, 0) },
+		},
+	});
+	const subscription = parseSubscription({
+		data: { planId: "individual-go", status: "active" },
+	});
+	const painted = [];
+	const color = (kind, text) => {
+		painted.push([kind, text]);
+		return text;
+	};
+
+	assert.ok(credits);
+	formatQuotaBar(credits, subscription, color);
+	assert.deepEqual(
+		painted.map(([kind]) => kind),
+		["warning", "error", "success"],
+	);
+});
+
+function jsonResponse(data) {
+	return new Response(JSON.stringify(data), {
+		status: 200,
+		headers: { "content-type": "application/json" },
+	});
+}
+
+function billingFetch() {
+	return async (input) => {
+		const url = String(input);
+		if (url.includes("/alpha/billing/credits")) {
+			return jsonResponse({
+				credits: { monthlyCredits: 62.3, purchasedCredits: 0, freeCredits: 0, belowThreshold: false },
+				windowLimits: {
+					limited: true,
+					fiveHour: { used: 1.8, cap: 10, exceeded: false, resetAt: Date.UTC(2026, 8, 12, 7, 0) },
+					weekly: { used: 3.2, cap: 40, exceeded: false, resetAt: Date.UTC(2026, 8, 15, 7, 0) },
+				},
+			});
+		}
+		if (url.includes("/alpha/billing/subscriptions")) {
+			return jsonResponse({
+				data: {
+					planId: "individual-goat",
+					status: "active",
+					currentPeriodEnd: "2026-09-30T00:00:00.000Z",
+				},
+			});
+		}
+		if (url.includes("/provider/v1/models")) {
+			return jsonResponse({ data: [] });
+		}
+		return new Response("no", { status: 404 });
+	};
+}
+
+async function bootQuotaExtension() {
+	const handlers = new Map();
+	await registerCommandCode({
+		registerProvider() {},
+		registerCommand() {},
+		on(name, handler) {
+			handlers.set(name, handler);
+		},
+	});
+	return handlers;
+}
+
+function makeQuotaCtx({ provider = "commandcode", apiKey = "user_test" } = {}) {
+	const widgets = [];
+	return {
+		widgets,
+		ctx: {
+			hasUI: true,
+			mode: "tui",
+			model: { provider, id: "deepseek/deepseek-v4-pro" },
+			modelRegistry: {
+				async getApiKeyForProvider(name) {
+					if (name !== "commandcode") return undefined;
+					return apiKey || undefined;
+				},
+			},
+			ui: {
+				theme: { fg(_kind, text) { return text; } },
+				setWidget(id, content, opts) {
+					widgets.push({ id, content, opts });
+				},
+			},
+		},
+	};
+}
+
+test("shows the quota bar below the editor for Command Code models", async (t) => {
+	const handlers = await bootQuotaExtension();
+	t.mock.method(globalThis, "fetch", billingFetch());
+	const { ctx, widgets } = makeQuotaCtx();
+	t.after(async () => {
+		await handlers.get("session_shutdown")?.({}, ctx);
+	});
+
+	await handlers.get("session_start")({}, ctx);
+
+	const last = widgets.at(-1);
+	assert.equal(last?.id, "cc-quota");
+	assert.deepEqual(last?.opts, { placement: "belowEditor" });
+	assert.equal(last?.content[0], "5h ▓▓░░░░░░░░ 18%   Wk ▓░░░░░░░░░  8%   Mo ▓░░░░░░░░░ 11%");
+});
+
+test("hides the quota bar when leaving Command Code models", async (t) => {
+	const handlers = await bootQuotaExtension();
+	t.mock.method(globalThis, "fetch", billingFetch());
+	const { ctx, widgets } = makeQuotaCtx();
+	t.after(async () => {
+		await handlers.get("session_shutdown")?.({}, ctx);
+	});
+
+	await handlers.get("session_start")({}, ctx);
+	const other = { ...ctx, model: { provider: "openai", id: "gpt-5.4" } };
+	await handlers.get("model_select")({ model: other.model }, other);
+
+	const last = widgets.at(-1);
+	assert.equal(last?.id, "cc-quota");
+	assert.equal(last?.content, undefined);
+});
+
+test("does not show a quota bar without a Command Code key", async (t) => {
+	const previous = process.env.COMMANDCODE_API_KEY;
+	delete process.env.COMMANDCODE_API_KEY;
+	t.after(() => {
+		if (previous === undefined) delete process.env.COMMANDCODE_API_KEY;
+		else process.env.COMMANDCODE_API_KEY = previous;
+	});
+
+	const handlers = await bootQuotaExtension();
+	t.mock.method(globalThis, "fetch", billingFetch());
+	const { ctx, widgets } = makeQuotaCtx({ apiKey: "" });
+	t.after(async () => {
+		await handlers.get("session_shutdown")?.({}, ctx);
+	});
+
+	await handlers.get("session_start")({}, ctx);
+
+	assert.equal(widgets.length, 0);
+});
+
+test("keeps the last quota bar when the credits fetch later fails", async (t) => {
+	const handlers = await bootQuotaExtension();
+	let creditsOk = true;
+	t.mock.method(globalThis, "fetch", async (input) => {
+		const url = String(input);
+		if (url.includes("/alpha/billing/credits") && !creditsOk) {
+			return new Response("no", { status: 500 });
+		}
+		return billingFetch()(input);
+	});
+	const { ctx, widgets } = makeQuotaCtx();
+	t.after(async () => {
+		await handlers.get("session_shutdown")?.({}, ctx);
+	});
+
+	await handlers.get("session_start")({}, ctx);
+	const shown = widgets.at(-1)?.content?.[0];
+	assert.equal(shown, "5h ▓▓░░░░░░░░ 18%   Wk ▓░░░░░░░░░  8%   Mo ▓░░░░░░░░░ 11%");
+
+	creditsOk = false;
+	await handlers.get("agent_settled")({}, ctx);
+	assert.equal(widgets.at(-1)?.content?.[0], shown);
+	assert.equal(widgets.length, 1);
+});
+
+test("keeps the monthly segment when the subscription fetch later fails", async (t) => {
+	const handlers = await bootQuotaExtension();
+	let subscriptionsOk = true;
+	t.mock.method(globalThis, "fetch", async (input) => {
+		const url = String(input);
+		if (url.includes("/alpha/billing/subscriptions") && !subscriptionsOk) {
+			return new Response("no", { status: 500 });
+		}
+		return billingFetch()(input);
+	});
+	const { ctx, widgets } = makeQuotaCtx();
+	t.after(async () => {
+		await handlers.get("session_shutdown")?.({}, ctx);
+	});
+
+	await handlers.get("session_start")({}, ctx);
+	assert.match(widgets.at(-1)?.content?.[0] ?? "", /Mo /);
+
+	subscriptionsOk = false;
+	await handlers.get("agent_settled")({}, ctx);
+	assert.match(widgets.at(-1)?.content?.[0] ?? "", /Mo /);
+});
+
+test("does not hide a monthly-only bar when the subscription fetch later fails", async (t) => {
+	const handlers = await bootQuotaExtension();
+	let subscriptionsOk = true;
+	t.mock.method(globalThis, "fetch", async (input) => {
+		const url = String(input);
+		if (url.includes("/alpha/billing/credits")) {
+			return jsonResponse({
+				credits: { monthlyCredits: 9, purchasedCredits: 0, freeCredits: 0, belowThreshold: false },
+				windowLimits: { limited: false },
+			});
+		}
+		if (url.includes("/alpha/billing/subscriptions")) {
+			if (!subscriptionsOk) return new Response("no", { status: 500 });
+			return jsonResponse({ data: { planId: "individual-go", status: "active" } });
+		}
+		return jsonResponse({ data: [] });
+	});
+	const { ctx, widgets } = makeQuotaCtx();
+	t.after(async () => {
+		await handlers.get("session_shutdown")?.({}, ctx);
+	});
+
+	await handlers.get("session_start")({}, ctx);
+	assert.equal(widgets.at(-1)?.content?.[0], "Mo ▓░░░░░░░░░ 10%");
+
+	subscriptionsOk = false;
+	await handlers.get("agent_settled")({}, ctx);
+	assert.equal(widgets.at(-1)?.content?.[0], "Mo ▓░░░░░░░░░ 10%");
 });
