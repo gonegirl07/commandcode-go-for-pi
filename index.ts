@@ -42,7 +42,7 @@ import {
 	calculateCost,
 	createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const BASE_URL = "https://api.commandcode.ai";
 const ENDPOINT = "/alpha/generate";
@@ -953,6 +953,72 @@ export function formatReport(
 	return lines.join("\n");
 }
 
+const QUOTA_BAR_WIDTH = 10;
+const QUOTA_BAR_FILLED = "▓";
+const QUOTA_BAR_EMPTY = "░";
+
+export type QuotaBarColor = "success" | "warning" | "error";
+
+function usageColor(ratio: number, exhausted: boolean): QuotaBarColor {
+	if (exhausted || ratio >= 0.9) return "error";
+	if (ratio >= 0.7) return "warning";
+	return "success";
+}
+
+function formatBarSegment(
+	label: string,
+	used: number,
+	cap: number,
+	exhausted: boolean,
+	color?: (kind: QuotaBarColor, text: string) => string,
+): string | undefined {
+	if (!(cap > 0)) return undefined;
+	const ratio = Math.min(1, Math.max(0, used / cap));
+	const percent = Math.round(ratio * 100);
+	const filled = Math.round(ratio * QUOTA_BAR_WIDTH);
+	const bar = QUOTA_BAR_FILLED.repeat(filled) + QUOTA_BAR_EMPTY.repeat(QUOTA_BAR_WIDTH - filled);
+	const painted = `${bar} ${String(percent).padStart(2)}%`;
+	const body = color ? color(usageColor(ratio, exhausted || used >= cap), painted) : painted;
+	return `${label} ${body}`;
+}
+
+export function formatQuotaBar(
+	credits: CreditsSnapshot,
+	subscription: SubscriptionSnapshot | undefined,
+	color?: (kind: QuotaBarColor, text: string) => string,
+): string {
+	const segments: string[] = [];
+	if (credits.limited) {
+		if (credits.fiveHour) {
+			const segment = formatBarSegment(
+				"5h",
+				credits.fiveHour.used,
+				credits.fiveHour.cap,
+				credits.fiveHour.exceeded,
+				color,
+			);
+			if (segment) segments.push(segment);
+		}
+		if (credits.weekly) {
+			const segment = formatBarSegment(
+				"Wk",
+				credits.weekly.used,
+				credits.weekly.cap,
+				credits.weekly.exceeded,
+				color,
+			);
+			if (segment) segments.push(segment);
+		}
+	}
+	const monthlyCap = subscription?.planId ? MONTHLY_ALLOWANCE[subscription.planId] : undefined;
+	if (monthlyCap !== undefined) {
+		const used = Math.max(0, monthlyCap - credits.monthlyCredits);
+		const segment = formatBarSegment("Mo", used, monthlyCap, used >= monthlyCap, color);
+		if (segment) segments.push(segment);
+	}
+	return segments.join("   ");
+}
+
 function previewRaw(raw: string | undefined): string {
 	if (!raw) return "";
 	const compact = raw.replace(/\s+/g, " ").trim();
@@ -1008,7 +1074,7 @@ async function getJson(path: string, apiKey: string): Promise<FetchResult> {
 	}
 }
 
-async function resolveUsageApiKey(ctx: ExtensionCommandContext): Promise<string | undefined> {
+async function resolveUsageApiKey(ctx: ExtensionContext): Promise<string | undefined> {
 	const fromRegistry = await ctx.modelRegistry.getApiKeyForProvider("commandcode");
 	if (fromRegistry) return fromRegistry;
 	const fromEnv = process.env.COMMANDCODE_API_KEY;
@@ -1056,6 +1122,95 @@ async function runUsage(_args: string, ctx: ExtensionCommandContext): Promise<vo
 	ctx.ui.notify(report, kind);
 }
 
+// ---- Quota bar (below editor) -------------------------------------------
+
+const QUOTA_WIDGET_ID = "cc-quota";
+const QUOTA_REFRESH_MS = 60_000;
+
+function isCommandCodeModel(model: { provider?: string } | undefined): boolean {
+	return model?.provider === "commandcode";
+}
+
+async function loadQuota(apiKey: string): Promise<{
+	credits: CreditsSnapshot;
+	subscription?: SubscriptionSnapshot;
+} | undefined> {
+	const [creditsResult, subscriptionResult] = await Promise.all([
+		getJson("/alpha/billing/credits", apiKey),
+		getJson("/alpha/billing/subscriptions", apiKey),
+	]);
+	if (!creditsResult.ok) return undefined;
+	const credits = parseCredits(creditsResult.data);
+	if (!credits) return undefined;
+	return {
+		credits,
+		subscription: subscriptionResult.ok ? parseSubscription(subscriptionResult.data) : undefined,
+	};
+}
+
+let quotaTimer: ReturnType<typeof setInterval> | undefined;
+let quotaCtx: ExtensionContext | undefined;
+let quotaGeneration = 0;
+let lastQuotaSnapshot:
+	| { credits: CreditsSnapshot; subscription?: SubscriptionSnapshot }
+	| undefined;
+
+function clearQuotaTimer(): void {
+	if (!quotaTimer) return;
+	clearInterval(quotaTimer);
+	quotaTimer = undefined;
+}
+
+function ensureQuotaTimer(): void {
+	if (quotaTimer) return;
+	quotaTimer = setInterval(() => {
+		if (quotaCtx) void refreshQuotaBar(quotaCtx);
+	}, QUOTA_REFRESH_MS);
+	quotaTimer.unref();
+}
+
+function hideQuotaBar(ctx: ExtensionContext): void {
+	if (!ctx.hasUI) return;
+	ctx.ui.setWidget(QUOTA_WIDGET_ID, undefined);
+}
+
+function showQuotaBar(ctx: ExtensionContext, line: string): void {
+	if (!ctx.hasUI) return;
+	ctx.ui.setWidget(QUOTA_WIDGET_ID, [line], { placement: "belowEditor" });
+}
+
+async function refreshQuotaBar(ctx: ExtensionContext): Promise<void> {
+	if (!ctx.hasUI) return;
+	const generation = ++quotaGeneration;
+	if (!isCommandCodeModel(ctx.model)) {
+		lastQuotaSnapshot = undefined;
+		hideQuotaBar(ctx);
+		clearQuotaTimer();
+		return;
+	}
+	const apiKey = await resolveUsageApiKey(ctx);
+	if (generation !== quotaGeneration) return;
+	if (!apiKey) return;
+	const snapshot = await loadQuota(apiKey);
+	if (generation !== quotaGeneration) return;
+	if (!snapshot) return;
+	const subscription = snapshot.subscription ?? lastQuotaSnapshot?.subscription;
+	const line = formatQuotaBar(snapshot.credits, subscription, (kind, text) =>
+		ctx.ui.theme.fg(kind, text),
+	);
+	if (!line) {
+		if (!lastQuotaSnapshot) hideQuotaBar(ctx);
+		return;
+	}
+	lastQuotaSnapshot = { credits: snapshot.credits, subscription };
+	showQuotaBar(ctx, line);
+	ensureQuotaTimer();
+}
+
+function bindQuotaSession(ctx: ExtensionContext): void {
+	quotaCtx = ctx;
+}
+
 // ---- Extension entry point ----------------------------------------------
 
 export default async function (pi: ExtensionAPI) {
@@ -1084,5 +1239,24 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerCommand("cc-usage", {
 		description: "Show Command Code plan credits and usage limits",
 		handler: runUsage,
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		bindQuotaSession(ctx);
+		await refreshQuotaBar(ctx);
+	});
+	pi.on("model_select", async (_event, ctx) => {
+		bindQuotaSession(ctx);
+		await refreshQuotaBar(ctx);
+	});
+	pi.on("agent_settled", async (_event, ctx) => {
+		bindQuotaSession(ctx);
+		await refreshQuotaBar(ctx);
+	});
+	pi.on("session_shutdown", async () => {
+		clearQuotaTimer();
+		quotaCtx = undefined;
+		lastQuotaSnapshot = undefined;
+		quotaGeneration += 1;
 	});
 }
