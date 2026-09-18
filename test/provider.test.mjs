@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import registerCommandCode, {
@@ -9,6 +12,10 @@ import registerCommandCode, {
 	parseProviderModels,
 	parseSubscription,
 } from "../index.ts";
+
+// Keep key-pool tests hermetic: the extension reads
+// $PI_CODING_AGENT_DIR/commandcode-keys.json.
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "commandcode-agent-"));
 
 let provider;
 let commands;
@@ -59,8 +66,9 @@ test("registers a self-contained Command Code provider", () => {
 	assert.ok(provider.models.some((model) => model.id === "deepseek/deepseek-v4-pro"));
 });
 
-test("registers the Command Code usage command in the same extension", () => {
+test("registers the Command Code usage and key commands in the same extension", () => {
 	assert.equal(commands.get("cc-usage")?.handler instanceof Function, true);
+	assert.equal(commands.get("cc-keys")?.handler instanceof Function, true);
 });
 
 test("parses provider models from Command Code's public catalog shape", () => {
@@ -542,4 +550,334 @@ test("does not hide a monthly-only bar when the subscription fetch later fails",
 	subscriptionsOk = false;
 	await handlers.get("agent_settled")({}, ctx);
 	assert.equal(widgets.at(-1)?.content?.[0], "Mo ▓░░░░░░░░░ 10%");
+});
+
+// ---- Multiple API keys ---------------------------------------------------
+
+function useKeysEnv(t, keys) {
+	const previous = process.env.COMMANDCODE_API_KEYS;
+	process.env.COMMANDCODE_API_KEYS = keys.join(",");
+	t.after(() => {
+		if (previous === undefined) delete process.env.COMMANDCODE_API_KEYS;
+		else process.env.COMMANDCODE_API_KEYS = previous;
+	});
+}
+
+function useAgentDir(t) {
+	const dir = mkdtempSync(join(tmpdir(), "commandcode-agent-keys-"));
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = dir;
+	t.after(() => {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+	});
+	return dir;
+}
+
+function windowCredits({ fiveHour, weekly, monthlyCredits = 62.5 }) {
+	return {
+		credits: { monthlyCredits, purchasedCredits: 0, freeCredits: 0, belowThreshold: false },
+		windowLimits: { limited: true, fiveHour, weekly },
+	};
+}
+
+function windowState({ used, cap, exceeded, resetAt }) {
+	return { used, cap, exceeded, resetAt };
+}
+
+const SUBSCRIPTION = {
+	data: { planId: "individual-goat", status: "active", currentPeriodEnd: "2026-09-30T00:00:00.000Z" },
+};
+
+function keyedFetch(states, generations) {
+	return async (input, init) => {
+		const url = String(input);
+		const key = String(init?.headers?.Authorization ?? "").replace("Bearer ", "");
+		if (url.includes("/alpha/generate")) {
+			generations.push(key);
+			const generate = states[key]?.generate;
+			if (!generate) throw new Error(`generate request used an unconfigured key: ${key}`);
+			return generate();
+		}
+		const state = states[key];
+		if (!state) return new Response("no", { status: 404 });
+		if (url.includes("/alpha/billing/credits")) return jsonResponse(state.credits);
+		if (url.includes("/alpha/billing/subscriptions")) return jsonResponse(state.subscription ?? SUBSCRIPTION);
+		return new Response("no", { status: 404 });
+	};
+}
+
+function commandCodeModel() {
+	const model = provider.models.find((entry) => entry.id === "deepseek/deepseek-v4-pro");
+	assert.ok(model);
+	return model;
+}
+
+function emptyContext() {
+	return { systemPrompt: "", messages: [], tools: [] };
+}
+
+test("fails over to the next key when the active key's quota is exhausted", async (t) => {
+	useKeysEnv(t, ["user_first", "user_second"]);
+	useAgentDir(t);
+	const generations = [];
+	const resetAt = Date.now() + 3 * 60 * 60 * 1000;
+	t.mock.method(
+		globalThis,
+		"fetch",
+		keyedFetch(
+			{
+				user_first: {
+					credits: windowCredits({
+						fiveHour: windowState({ used: 10, cap: 10, exceeded: true, resetAt }),
+						weekly: windowState({ used: 1, cap: 40, exceeded: false, resetAt }),
+					}),
+					generate: () => new Response(JSON.stringify({ error: "quota exceeded" }), { status: 429 }),
+				},
+				user_second: {
+					credits: windowCredits({
+						fiveHour: windowState({ used: 1, cap: 10, exceeded: false, resetAt }),
+						weekly: windowState({ used: 1, cap: 40, exceeded: false, resetAt }),
+					}),
+					generate: terminalResponse,
+				},
+			},
+			generations,
+		),
+	);
+
+	const terminal = await drain(provider.streamSimple(commandCodeModel(), emptyContext(), { apiKey: "user_first" }));
+	assert.equal(terminal?.type, "done");
+	assert.deepEqual(generations, ["user_first", "user_second"]);
+
+	// The exhausted key is parked until its reported reset, so the next request
+	// goes straight to the key that still has quota.
+	await drain(provider.streamSimple(commandCodeModel(), emptyContext(), { apiKey: "user_first" }));
+	assert.deepEqual(generations, ["user_first", "user_second", "user_second"]);
+});
+
+test("skips a key the quota bar parked and labels the bar with the key in use", async (t) => {
+	useKeysEnv(t, ["user_parked", "user_ready"]);
+	useAgentDir(t);
+	const handlers = await bootQuotaExtension();
+	const generations = [];
+	const resetAt = Date.now() + 60 * 60 * 1000;
+	t.mock.method(
+		globalThis,
+		"fetch",
+		keyedFetch(
+			{
+				user_parked: {
+					credits: windowCredits({
+						fiveHour: windowState({ used: 10, cap: 10, exceeded: true, resetAt }),
+						weekly: windowState({ used: 1, cap: 40, exceeded: false, resetAt }),
+					}),
+				},
+				user_ready: {
+					credits: windowCredits({
+						fiveHour: windowState({ used: 2, cap: 10, exceeded: false, resetAt }),
+						weekly: windowState({ used: 1, cap: 40, exceeded: false, resetAt }),
+					}),
+					generate: terminalResponse,
+				},
+			},
+			generations,
+		),
+	);
+	const { ctx, widgets } = makeQuotaCtx({ apiKey: "user_parked" });
+	t.after(async () => {
+		await handlers.get("session_shutdown")?.({}, ctx);
+	});
+
+	await handlers.get("session_start")({}, ctx);
+	assert.match(widgets.at(-1)?.content?.[0] ?? "", /^#2\/2 5h /);
+
+	const terminal = await drain(provider.streamSimple(commandCodeModel(), emptyContext(), { apiKey: "user_parked" }));
+	assert.equal(terminal?.type, "done");
+	assert.deepEqual(generations, ["user_ready"]);
+});
+
+test("rotates on a quota error event that arrives before any content", async (t) => {
+	useKeysEnv(t, ["user_event", "user_event_backup"]);
+	useAgentDir(t);
+	const generations = [];
+	const resetAt = Date.now() + 60 * 60 * 1000;
+	const quota = windowCredits({
+		fiveHour: windowState({ used: 10, cap: 10, exceeded: true, resetAt }),
+		weekly: windowState({ used: 1, cap: 40, exceeded: false, resetAt }),
+	});
+	const healthy = windowCredits({
+		fiveHour: windowState({ used: 1, cap: 10, exceeded: false, resetAt }),
+		weekly: windowState({ used: 1, cap: 40, exceeded: false, resetAt }),
+	});
+	const rejection = '{"type":"error","message":"weekly quota exhausted"}\n';
+	t.mock.method(
+		globalThis,
+		"fetch",
+		keyedFetch(
+			{
+				user_event: {
+					credits: quota,
+					generate: () =>
+						new Response(rejection, {
+							status: 200,
+							headers: { "content-type": "application/x-ndjson" },
+						}),
+				},
+				user_event_backup: { credits: healthy, generate: terminalResponse },
+			},
+			generations,
+		),
+	);
+
+	const terminal = await drain(provider.streamSimple(commandCodeModel(), emptyContext(), { apiKey: "user_event" }));
+	assert.equal(terminal?.type, "done");
+	assert.deepEqual(generations, ["user_event", "user_event_backup"]);
+});
+
+test("parks a key whose monthly credits are gone when the reset date is unknown", async (t) => {
+	useKeysEnv(t, ["user_monthly"]);
+	useAgentDir(t);
+	const handlers = await bootQuotaExtension();
+	const generations = [];
+	t.mock.method(
+		globalThis,
+		"fetch",
+		keyedFetch(
+			{
+				user_monthly: {
+					credits: windowCredits({
+						monthlyCredits: 0,
+						fiveHour: windowState({ used: 1, cap: 10, exceeded: false, resetAt: Date.now() + 3_600_000 }),
+						weekly: windowState({ used: 1, cap: 40, exceeded: false, resetAt: Date.now() + 86_400_000 }),
+					}),
+					subscription: { data: { planId: "individual-goat", status: "active" } },
+				},
+			},
+			generations,
+		),
+	);
+	const { ctx, widgets } = makeQuotaCtx({ apiKey: "user_monthly" });
+	t.after(async () => {
+		await handlers.get("session_shutdown")?.({}, ctx);
+	});
+
+	await handlers.get("session_start")({}, ctx);
+	assert.match(widgets.at(-1)?.content?.[0] ?? "", /^All 1 Command Code keys are quota-limited · monthly/);
+
+	const terminal = await drain(provider.streamSimple(commandCodeModel(), emptyContext(), { apiKey: "user_monthly" }));
+	assert.equal(terminal?.type, "error");
+	assert.deepEqual(generations, []);
+});
+
+test("does not retry a key that already streamed content", async (t) => {
+	useKeysEnv(t, ["user_streamed", "user_backup"]);
+	useAgentDir(t);
+	const generations = [];
+	const resetAt = Date.now() + 60 * 60 * 1000;
+	const quota = windowCredits({
+		fiveHour: windowState({ used: 1, cap: 10, exceeded: false, resetAt }),
+		weekly: windowState({ used: 1, cap: 40, exceeded: false, resetAt }),
+	});
+	const partial = [
+		'{"type":"text-start","id":"txt-0"}',
+		'{"type":"text-delta","id":"txt-0","text":"partial answer"}',
+		'{"type":"error","message":"monthly quota exhausted"}',
+	].join("\n");
+	t.mock.method(
+		globalThis,
+		"fetch",
+		keyedFetch(
+			{
+				user_streamed: {
+					credits: quota,
+					generate: () =>
+						new Response(partial, {
+							status: 200,
+							headers: { "content-type": "application/x-ndjson" },
+						}),
+				},
+				user_backup: { credits: quota, generate: terminalResponse },
+			},
+			generations,
+		),
+	);
+
+	const terminal = await drain(provider.streamSimple(commandCodeModel(), emptyContext(), { apiKey: "user_streamed" }));
+	assert.equal(terminal?.type, "error");
+	assert.match(terminal?.error?.errorMessage ?? "", /quota/);
+	assert.deepEqual(generations, ["user_streamed"]);
+});
+
+test("fails fast with the next reset when every key is parked", async (t) => {
+	useKeysEnv(t, ["user_park_a", "user_park_b"]);
+	useAgentDir(t);
+	const handlers = await bootQuotaExtension();
+	const generations = [];
+	const fiveHourReset = Date.now() + 60 * 60 * 1000;
+	const weeklyReset = Date.now() + 2 * 86_400_000;
+	t.mock.method(
+		globalThis,
+		"fetch",
+		keyedFetch(
+			{
+				user_park_a: {
+					credits: windowCredits({
+						fiveHour: windowState({ used: 12, cap: 10, exceeded: true, resetAt: fiveHourReset }),
+						weekly: windowState({ used: 1, cap: 40, exceeded: false, resetAt: weeklyReset }),
+					}),
+				},
+				user_park_b: {
+					credits: windowCredits({
+						fiveHour: windowState({ used: 1, cap: 10, exceeded: false, resetAt: fiveHourReset }),
+						weekly: windowState({ used: 40, cap: 40, exceeded: true, resetAt: weeklyReset }),
+					}),
+				},
+			},
+			generations,
+		),
+	);
+	const { ctx, widgets } = makeQuotaCtx({ apiKey: "user_park_a" });
+	t.after(async () => {
+		await handlers.get("session_shutdown")?.({}, ctx);
+	});
+
+	await handlers.get("session_start")({}, ctx);
+	assert.match(widgets.at(-1)?.content?.[0] ?? "", /^All 2 Command Code keys are quota-limited/);
+
+	const terminal = await drain(provider.streamSimple(commandCodeModel(), emptyContext(), { apiKey: "user_park_a" }));
+	assert.equal(terminal?.type, "error");
+	assert.match(terminal?.error?.errorMessage ?? "", /quota-limited/);
+	assert.deepEqual(generations, []);
+});
+
+test("stores an extra key once through /cc-keys", async (t) => {
+	useKeysEnv(t, []);
+	const agentDir = useAgentDir(t);
+	const notifications = [];
+	const ctx = {
+		hasUI: true,
+		modelRegistry: {
+			async getApiKeyForProvider() {
+				return "user_primary";
+			},
+		},
+		ui: {
+			notify(text, kind) {
+				notifications.push({ text, kind });
+			},
+		},
+	};
+	const handler = commands.get("cc-keys")?.handler;
+	assert.equal(handler instanceof Function, true);
+
+	await handler("add user_extra_one", ctx);
+	await handler("add user_extra_one", ctx);
+	assert.deepEqual(JSON.parse(readFileSync(join(agentDir, "commandcode-keys.json"), "utf8")), ["user_extra_one"]);
+
+	await handler("", ctx);
+	const listed = notifications.at(-1)?.text ?? "";
+	assert.match(listed, /Command Code keys\s+2/);
+	assert.match(listed, /auth\.json/);
+	assert.match(listed, /keys file/);
 });

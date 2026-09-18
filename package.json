@@ -26,6 +26,7 @@
   },
   "files": [
     "index.ts",
+    "omp",
     "README.md",
     "LICENSE"
   ],
@@ -40,6 +41,11 @@
   "pi": {
     "extensions": [
       "./index.ts"
+    ]
+  },
+  "omp": {
+    "extensions": [
+      "omp/commandcode-quota.ts"
     ]
   },
   "scripts": {

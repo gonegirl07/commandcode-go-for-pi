@@ -7,8 +7,11 @@
  * generation, so we stick to the native /alpha/generate envelope the CLI
  * itself uses (GET /provider/v1/models is readable for the roster).
  *
- * Authenticates with COMMANDCODE_API_KEY (a "user_..." token from
- * https://commandcode.ai/settings/billing or `cmd auth status`).
+ * Authenticates with a "user_..." token from
+ * https://commandcode.ai/settings/billing or `cmd auth status`: the key Pi
+ * resolved (auth.json, else COMMANDCODE_API_KEY) first, then any extra keys in
+ * $PI_CODING_AGENT_DIR/commandcode-keys.json. When a key's 5-hour, weekly, or
+ * monthly quota runs out, the next key takes over — see "Multiple API keys".
  *
  * Wire shape, sender:
  *   POST /alpha/generate
@@ -30,6 +33,10 @@
  *   {"type":"tool-input-end","id":"call_..."}
  *   {"type":"finish-step","finishReason":"stop"|"length"|"tool-calls","usage":{...}}
  */
+
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import {
 	type Api,
@@ -481,7 +488,245 @@ function resolveCommandCodeApiKey(apiKey: string | undefined): string | undefine
 	return apiKey;
 }
 
+// ---- Multiple API keys ---------------------------------------------------
+//
+// Command Code meters quota per account, so the provider keeps an ordered pool:
+// the key Pi resolved (auth.json, else COMMANDCODE_API_KEY) first, then the
+// extra keys stored in $PI_CODING_AGENT_DIR/commandcode-keys.json. A key whose
+// 5-hour, weekly, or monthly quota is gone is parked until the reset time the
+// billing API reports and the next key takes over — including mid-request, as
+// long as nothing has streamed yet. Parking lives in memory only, so a new
+// session or /reload re-probes every key.
+
+const KEYS_FILE_NAME = "commandcode-keys.json";
+const RATE_LIMIT_COOLDOWN_MS = 60_000;
+const UNKNOWN_MONTHLY_RESET_MS = 6 * 60 * 60 * 1000;
+const QUOTA_ERROR_RE = /quota|credit|insufficient|exceed|balance|limit/i;
+
+type KeySource = "pi" | "file" | "env";
+
+type PoolKey = {
+	key: string;
+	source: KeySource;
+};
+
+type KeyBlock = { blockedUntil: number; reason: string };
+
+const KEY_SOURCE_LABEL: Record<KeySource, string> = {
+	pi: "auth.json",
+	file: "keys file",
+	env: "COMMANDCODE_API_KEYS",
+};
+
+/** Keys parked by a quota or rate-limit rejection, keyed by the key itself. */
+const keyBlocks = new Map<string, KeyBlock>();
+
+function agentDir(): string {
+	const configured = process.env.PI_CODING_AGENT_DIR;
+	if (configured && configured.length > 0) {
+		return configured.startsWith("~") ? join(homedir(), configured.slice(1)) : configured;
+	}
+	return join(homedir(), ".pi", "agent");
+}
+
+function parseKeysFile(text: string): string[] {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return [];
+	}
+	const list = Array.isArray(parsed)
+		? parsed
+		: parsed && typeof parsed === "object" && "keys" in parsed
+			? parsed.keys
+			: undefined;
+	if (!Array.isArray(list)) return [];
+	return list
+		.filter((entry): entry is string => typeof entry === "string")
+		.map((entry) => entry.trim())
+		.filter((entry) => entry.length > 0);
+}
+
+function parseKeyList(value: string | undefined): string[] {
+	return (value ?? "")
+		.split(/[\s,]+/)
+		.map((entry) => entry.trim())
+		.filter((entry) => entry.length > 0);
+}
+
+async function readKeysFile(): Promise<string[]> {
+	try {
+		return parseKeysFile(await readFile(join(agentDir(), KEYS_FILE_NAME), "utf8"));
+	} catch {
+		return [];
+	}
+}
+
+async function writeKeysFile(keys: string[]): Promise<void> {
+	await mkdir(agentDir(), { recursive: true });
+	await writeFile(join(agentDir(), KEYS_FILE_NAME), `${JSON.stringify(keys, null, 2)}\n`, { mode: 0o600 });
+}
+
+async function buildKeyPool(piKey: string | undefined): Promise<PoolKey[]> {
+	const entries: PoolKey[] = [];
+	const add = (key: string | undefined, source: KeySource): void => {
+		const trimmed = key?.trim();
+		if (!trimmed || entries.some((entry) => entry.key === trimmed)) return;
+		entries.push({ key: trimmed, source });
+	};
+
+	const envKeys = parseKeyList(process.env.COMMANDCODE_API_KEYS);
+	if (envKeys.length > 0) {
+		for (const key of envKeys) add(key, "env");
+	} else {
+		add(resolveCommandCodeApiKey(piKey), "pi");
+		for (const key of await readKeysFile()) add(key, "file");
+	}
+
+	return entries;
+}
+
+/** The park record still in force for this key, if any. */
+function keyBlock(entry: PoolKey): KeyBlock | undefined {
+	const block = keyBlocks.get(entry.key);
+	return block && block.blockedUntil > Date.now() ? block : undefined;
+}
+
+function availableKeys(pool: PoolKey[]): PoolKey[] {
+	return pool.filter((entry) => keyBlock(entry) === undefined);
+}
+
+function markKeyBlocked(key: string, block: KeyBlock): void {
+	const current = keyBlocks.get(key);
+	if (current && current.blockedUntil >= block.blockedUntil) return;
+	keyBlocks.set(key, block);
+}
+
+function parkKey(key: string, reason: string, durationMs = RATE_LIMIT_COOLDOWN_MS): void {
+	markKeyBlocked(key, { blockedUntil: Date.now() + durationMs, reason });
+}
+
+function windowBlock(window: WindowUsage | undefined, reason: string, now: number): KeyBlock | undefined {
+	if (!window) return undefined;
+	if (!window.exceeded && window.used < window.cap) return undefined;
+	if (!(window.resetAt > now)) return undefined;
+	return { blockedUntil: window.resetAt, reason };
+}
+
+/** How long a key stays parked: until the last of its exhausted windows resets. */
+function exhaustionFromSnapshot(
+	credits: CreditsSnapshot,
+	subscription: SubscriptionSnapshot | undefined,
+	now = Date.now(),
+): KeyBlock | undefined {
+	const blocks = [windowBlock(credits.fiveHour, "5h", now), windowBlock(credits.weekly, "weekly", now)].filter(
+		(block): block is KeyBlock => block !== undefined,
+	);
+
+	if (credits.monthlyCredits + credits.purchasedCredits + credits.freeCredits <= 0) {
+		const periodEnd = subscription?.currentPeriodEnd ? Date.parse(subscription.currentPeriodEnd) : Number.NaN;
+		blocks.push({
+			blockedUntil: Number.isFinite(periodEnd) && periodEnd > now ? periodEnd : now + UNKNOWN_MONTHLY_RESET_MS,
+			reason: "monthly",
+		});
+	}
+
+	if (blocks.length === 0) return undefined;
+	return {
+		blockedUntil: Math.max(...blocks.map((block) => block.blockedUntil)),
+		reason: blocks.map((block) => block.reason).join("+"),
+	};
+}
+
+function maskKey(key: string): string {
+	return key.length <= 14 ? key : `${key.slice(0, 8)}…${key.slice(-4)}`;
+}
+
+function parkingSummary(pool: PoolKey[]): string {
+	const blocks = pool.map((entry) => keyBlock(entry)).filter((block): block is KeyBlock => block !== undefined);
+	const next = blocks.reduce((earliest, block) => (block.blockedUntil < earliest.blockedUntil ? block : earliest));
+	const reasons = [...new Set(blocks.map((block) => block.reason))].join(", ");
+	return `${reasons}; next reset ${formatReset(next.blockedUntil)}`;
+}
+
+async function probeKeyQuota(key: string): Promise<void> {
+	const snapshot = await loadQuota(key);
+	const exhaustion = snapshot ? exhaustionFromSnapshot(snapshot.credits, snapshot.subscription) : undefined;
+	if (exhaustion) markKeyBlocked(key, exhaustion);
+	else parkKey(key, "rate limited");
+}
+
+/** Records a failed key and reports whether the request should move to the next one. */
+async function noteKeyFailure(key: string, error: unknown): Promise<boolean> {
+	let rotate: boolean;
+	if (error instanceof CommandCodeRequestError) {
+		if (error.status === 401) {
+			parkKey(key, "unauthorized");
+			rotate = true;
+		} else if (error.status === 402 || error.status === 403 || error.status === 429) {
+			await probeKeyQuota(key);
+			rotate = true;
+		} else {
+			rotate = false;
+		}
+	} else {
+		const message = error instanceof Error ? error.message : String(error);
+		rotate = QUOTA_ERROR_RE.test(message);
+		if (rotate) await probeKeyQuota(key);
+	}
+
+	if (rotate && quotaCtx) void refreshQuotaBar(quotaCtx);
+	return rotate;
+}
+
 // ---- Stream implementation ----------------------------------------------
+
+/** HTTP rejection from the gateway; the status decides whether another key is tried. */
+class CommandCodeRequestError extends Error {
+	readonly status: number;
+
+	constructor(status: number, message: string) {
+		super(message);
+		this.name = "CommandCodeRequestError";
+		this.status = status;
+	}
+}
+
+async function sendGenerateRequest(
+	apiKey: string,
+	payload: string,
+	sessionId: string,
+	options: SimpleStreamOptions | undefined,
+): Promise<ReadableStream<Uint8Array>> {
+	const response = await fetch(`${BASE_URL}${ENDPOINT}`, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${apiKey}`,
+			"Content-Type": "application/json",
+			Accept: "application/x-ndjson",
+			"x-cli-environment": "production",
+			"x-command-code-version": COMMAND_CODE_VERSION,
+			"x-session-id": sessionId,
+			...(process.env.CMD_ZDR === "1" ? { "x-cmd-zdr": "1" } : {}),
+		},
+		body: payload,
+		signal: options?.signal,
+	});
+
+	const body = response.body;
+	if (!response.ok || !body) {
+		let detail = "";
+		try {
+			detail = await response.text();
+		} catch {}
+		throw new CommandCodeRequestError(
+			response.status,
+			`Command Code ${response.status}: ${detail || response.statusText}`,
+		);
+	}
+	return body;
+}
 
 function streamCommandCode(
 	model: Model<Api>,
@@ -510,8 +755,18 @@ function streamCommandCode(
 		};
 
 		try {
-			const apiKey = resolveCommandCodeApiKey(options?.apiKey);
-			if (!apiKey) throw new Error("No Command Code API key. Set COMMANDCODE_API_KEY=user_...");
+			const pool = await buildKeyPool(resolveCommandCodeApiKey(options?.apiKey));
+			if (pool.length === 0) {
+				throw new Error(
+					"No Command Code API key. Set COMMANDCODE_API_KEY=user_..., or add one with /cc-keys add user_...",
+				);
+			}
+			const candidates = availableKeys(pool);
+			if (candidates.length === 0) {
+				throw new Error(
+					`All ${pool.length} Command Code keys are quota-limited (${parkingSummary(pool)}). Add another key with /cc-keys add user_...`,
+				);
+			}
 
 			stream.push({ type: "start", partial: output });
 
@@ -548,232 +803,241 @@ function streamCommandCode(
 				},
 			};
 
-			const response = await fetch(`${BASE_URL}${ENDPOINT}`, {
-				method: "POST",
-				headers: {
-					Authorization: `Bearer ${apiKey}`,
-					"Content-Type": "application/json",
-					Accept: "application/x-ndjson",
-					"x-cli-environment": "production",
-					"x-command-code-version": COMMAND_CODE_VERSION,
-					"x-session-id": options?.sessionId ?? crypto.randomUUID(),
-					...(process.env.CMD_ZDR === "1" ? { "x-cmd-zdr": "1" } : {}),
-				},
-				body: JSON.stringify(body),
-				signal: options?.signal,
-			});
+			const sessionId = options?.sessionId ?? crypto.randomUUID();
+			const payload = JSON.stringify(body);
 
-			if (!response.ok || !response.body) {
-				let detail = "";
+			// One request per key. A key that runs out of quota hands the same payload
+			// to the next key, but only while nothing has streamed yet.
+			let attempts = 0;
+			let lastError: unknown;
+			retry: for (const candidate of candidates) {
+				attempts += 1;
+				let source: ReadableStream<Uint8Array>;
 				try {
-					detail = await response.text();
-				} catch {}
-				throw new Error(`Command Code ${response.status}: ${detail || response.statusText}`);
-			}
+					source = await sendGenerateRequest(candidate.key, payload, sessionId, options);
+				} catch (error) {
+					lastError = error;
+					if (await noteKeyFailure(candidate.key, error)) continue retry;
+					throw error;
+				}
 
-			// id-keyed maps: gateway gives us "reasoning-0", "txt-0", "call_..." as ids
-			const idToIndex = new Map<string, number>();
-			const toolJsonByIndex = new Map<number, string>();
-			const endedToolCalls = new Set<number>();
-			let sawTerminalEvent = false;
-
-			for await (const event of ndjsonLines(response.body)) {
-				if (!event || typeof event !== "object") continue;
-				const gatewayEvent = event as GatewayEvent;
-				const type = gatewayEvent.type;
-				if (!type) continue;
-
-				switch (type) {
-					case "reasoning-start": {
-						output.content.push({ type: "thinking", thinking: "" });
-						const idx = output.content.length - 1;
-						idToIndex.set(gatewayEvent.id, idx);
-						stream.push({ type: "thinking_start", contentIndex: idx, partial: output });
-						break;
-					}
-					case "reasoning-delta": {
-						const idx = idToIndex.get(gatewayEvent.id);
-						if (idx === undefined) break;
-						const block = output.content[idx];
-						if (block.type !== "thinking") break;
-						const delta = gatewayEvent.text ?? "";
-						block.thinking += delta;
-						stream.push({ type: "thinking_delta", contentIndex: idx, delta, partial: output });
-						break;
-					}
-					case "reasoning-end": {
-						const idx = idToIndex.get(gatewayEvent.id);
-						if (idx === undefined) break;
-						const block = output.content[idx];
-						if (block.type !== "thinking") break;
-						stream.push({
-							type: "thinking_end",
-							contentIndex: idx,
-							content: block.thinking,
-							partial: output,
-						});
-						break;
-					}
-					case "text-start": {
-						output.content.push({ type: "text", text: "" });
-						const idx = output.content.length - 1;
-						idToIndex.set(gatewayEvent.id, idx);
-						stream.push({ type: "text_start", contentIndex: idx, partial: output });
-						break;
-					}
-					case "text-delta": {
-						const idx = idToIndex.get(gatewayEvent.id);
-						if (idx === undefined) break;
-						const block = output.content[idx];
-						if (block.type !== "text") break;
-						const delta = gatewayEvent.text ?? "";
-						block.text += delta;
-						stream.push({ type: "text_delta", contentIndex: idx, delta, partial: output });
-						break;
-					}
-					case "text-end": {
-						const idx = idToIndex.get(gatewayEvent.id);
-						if (idx === undefined) break;
-						const block = output.content[idx];
-						if (block.type !== "text") break;
-						stream.push({
-							type: "text_end",
-							contentIndex: idx,
-							content: block.text,
-							partial: output,
-						});
-						break;
-					}
-					case "tool-input-start": {
-						const id = toolEventId(gatewayEvent);
-						if (!id) break;
-						output.content.push({
-							type: "toolCall",
-							id,
-							name: toolEventName(gatewayEvent),
-							arguments: {},
-						});
-						const idx = output.content.length - 1;
-						idToIndex.set(id, idx);
-						toolJsonByIndex.set(idx, "");
-						stream.push({ type: "toolcall_start", contentIndex: idx, partial: output });
-						break;
-					}
-					case "tool-input-delta": {
-						const id = toolEventId(gatewayEvent);
-						if (!id) break;
-						const idx = idToIndex.get(id);
-						if (idx === undefined) break;
-						const block = output.content[idx];
-						if (block.type !== "toolCall") break;
-						const delta = gatewayEvent.delta ?? "";
-						const acc = (toolJsonByIndex.get(idx) ?? "") + delta;
-						toolJsonByIndex.set(idx, acc);
-						try {
-							block.arguments = JSON.parse(acc);
-						} catch {
-							// JSON still streaming
+				// id-keyed maps: gateway gives us "reasoning-0", "txt-0", "call_..." as ids
+				const idToIndex = new Map<string, number>();
+				const toolJsonByIndex = new Map<number, string>();
+				const endedToolCalls = new Set<number>();
+				let sawTerminalEvent = false;
+	
+				for await (const event of ndjsonLines(source)) {
+					if (!event || typeof event !== "object") continue;
+					const gatewayEvent = event as GatewayEvent;
+					const type = gatewayEvent.type;
+					if (!type) continue;
+	
+					switch (type) {
+						case "reasoning-start": {
+							output.content.push({ type: "thinking", thinking: "" });
+							const idx = output.content.length - 1;
+							idToIndex.set(gatewayEvent.id, idx);
+							stream.push({ type: "thinking_start", contentIndex: idx, partial: output });
+							break;
 						}
-						stream.push({ type: "toolcall_delta", contentIndex: idx, delta, partial: output });
-						break;
-					}
-					case "tool-input-end":
-					case "tool-call": {
-						const id = toolEventId(gatewayEvent);
-						if (!id) break;
-						let idx = idToIndex.get(id);
-						if (idx === undefined) {
+						case "reasoning-delta": {
+							const idx = idToIndex.get(gatewayEvent.id);
+							if (idx === undefined) break;
+							const block = output.content[idx];
+							if (block.type !== "thinking") break;
+							const delta = gatewayEvent.text ?? "";
+							block.thinking += delta;
+							stream.push({ type: "thinking_delta", contentIndex: idx, delta, partial: output });
+							break;
+						}
+						case "reasoning-end": {
+							const idx = idToIndex.get(gatewayEvent.id);
+							if (idx === undefined) break;
+							const block = output.content[idx];
+							if (block.type !== "thinking") break;
+							stream.push({
+								type: "thinking_end",
+								contentIndex: idx,
+								content: block.thinking,
+								partial: output,
+							});
+							break;
+						}
+						case "text-start": {
+							output.content.push({ type: "text", text: "" });
+							const idx = output.content.length - 1;
+							idToIndex.set(gatewayEvent.id, idx);
+							stream.push({ type: "text_start", contentIndex: idx, partial: output });
+							break;
+						}
+						case "text-delta": {
+							const idx = idToIndex.get(gatewayEvent.id);
+							if (idx === undefined) break;
+							const block = output.content[idx];
+							if (block.type !== "text") break;
+							const delta = gatewayEvent.text ?? "";
+							block.text += delta;
+							stream.push({ type: "text_delta", contentIndex: idx, delta, partial: output });
+							break;
+						}
+						case "text-end": {
+							const idx = idToIndex.get(gatewayEvent.id);
+							if (idx === undefined) break;
+							const block = output.content[idx];
+							if (block.type !== "text") break;
+							stream.push({
+								type: "text_end",
+								contentIndex: idx,
+								content: block.text,
+								partial: output,
+							});
+							break;
+						}
+						case "tool-input-start": {
+							const id = toolEventId(gatewayEvent);
+							if (!id) break;
 							output.content.push({
 								type: "toolCall",
 								id,
 								name: toolEventName(gatewayEvent),
 								arguments: {},
 							});
-							idx = output.content.length - 1;
+							const idx = output.content.length - 1;
 							idToIndex.set(id, idx);
+							toolJsonByIndex.set(idx, "");
 							stream.push({ type: "toolcall_start", contentIndex: idx, partial: output });
+							break;
 						}
-						const block = output.content[idx];
-						if (block.type !== "toolCall") break;
-						// Some streams send full input on "tool-call"; prefer that if present
-						const completeInput = gatewayEvent.input ?? gatewayEvent.args;
-						if (completeInput && typeof completeInput === "object") {
-							block.arguments = completeInput;
-						} else {
-							const acc = toolJsonByIndex.get(idx) ?? "";
-							if (acc) {
-								try {
-									block.arguments = JSON.parse(acc);
-								} catch {}
+						case "tool-input-delta": {
+							const id = toolEventId(gatewayEvent);
+							if (!id) break;
+							const idx = idToIndex.get(id);
+							if (idx === undefined) break;
+							const block = output.content[idx];
+							if (block.type !== "toolCall") break;
+							const delta = gatewayEvent.delta ?? "";
+							const acc = (toolJsonByIndex.get(idx) ?? "") + delta;
+							toolJsonByIndex.set(idx, acc);
+							try {
+								block.arguments = JSON.parse(acc);
+							} catch {
+								// JSON still streaming
 							}
+							stream.push({ type: "toolcall_delta", contentIndex: idx, delta, partial: output });
+							break;
 						}
-						if (endedToolCalls.has(idx)) break;
-						endedToolCalls.add(idx);
-						stream.push({
-							type: "toolcall_end",
-							contentIndex: idx,
-							toolCall: {
-								type: "toolCall",
-								id: block.id,
-								name: block.name,
-								arguments: block.arguments,
-							},
-							partial: output,
-						});
-						break;
-					}
-					case "finish-step":
-					case "finish": {
-						sawTerminalEvent = true;
-						const usage = gatewayEvent.usage ?? gatewayEvent.totalUsage;
-						if (usage) {
-							// The gateway reports inputTokens as the TOTAL input (cached + uncached),
-							// matching the Vercel AI SDK convention. Pi's Usage shape expects
-							// `input` and `cacheRead` to be disjoint — calculateCost multiplies
-							// each separately, so leaving cached tokens inside `input` would
-							// double-charge on paid models. Subtract to match the convention
-							// used by the built-in Anthropic provider in pi-ai.
-							const totalInputTokens = usage.inputTokens ?? usage.input_tokens ?? 0;
-							const cacheReadTokens =
-								usage.cachedInputTokens ??
-								usage.inputTokenDetails?.cacheReadTokens ??
-								usage.raw?.prompt_cache_hit_tokens ??
-								0;
-							output.usage.input = Math.max(0, totalInputTokens - cacheReadTokens);
-							output.usage.output = usage.outputTokens ?? usage.output_tokens ?? 0;
-							output.usage.cacheRead = cacheReadTokens;
-							output.usage.cacheWrite = 0;
-							output.usage.totalTokens =
-								output.usage.input +
-								output.usage.output +
-								output.usage.cacheRead +
-								output.usage.cacheWrite;
-							calculateCost(model, output.usage);
+						case "tool-input-end":
+						case "tool-call": {
+							const id = toolEventId(gatewayEvent);
+							if (!id) break;
+							let idx = idToIndex.get(id);
+							if (idx === undefined) {
+								output.content.push({
+									type: "toolCall",
+									id,
+									name: toolEventName(gatewayEvent),
+									arguments: {},
+								});
+								idx = output.content.length - 1;
+								idToIndex.set(id, idx);
+								stream.push({ type: "toolcall_start", contentIndex: idx, partial: output });
+							}
+							const block = output.content[idx];
+							if (block.type !== "toolCall") break;
+							// Some streams send full input on "tool-call"; prefer that if present
+							const completeInput = gatewayEvent.input ?? gatewayEvent.args;
+							if (completeInput && typeof completeInput === "object") {
+								block.arguments = completeInput;
+							} else {
+								const acc = toolJsonByIndex.get(idx) ?? "";
+								if (acc) {
+									try {
+										block.arguments = JSON.parse(acc);
+									} catch {}
+								}
+							}
+							if (endedToolCalls.has(idx)) break;
+							endedToolCalls.add(idx);
+							stream.push({
+								type: "toolcall_end",
+								contentIndex: idx,
+								toolCall: {
+									type: "toolCall",
+									id: block.id,
+									name: block.name,
+									arguments: block.arguments,
+								},
+								partial: output,
+							});
+							break;
 						}
-						const reason = gatewayEvent.finishReason ?? gatewayEvent.rawFinishReason;
-						const sawToolCall = output.content.some((b) => b.type === "toolCall");
-						if (reason === "length") output.stopReason = "length";
-						else if (reason === "tool-calls" || reason === "tool_calls" || reason === "tool_use")
-							output.stopReason = "toolUse";
-						// Some OSS models report finishReason "stop" even when they emitted
-						// tool calls; pi must still route those as tool use (mirrors the
-						// cliproxy commandcode translator).
-						else if (sawToolCall) output.stopReason = "toolUse";
-						else output.stopReason = "stop";
-						break;
-					}
-					case "error": {
-						throw new Error(
-							gatewayEvent.message ??
-								(gatewayEvent.error === undefined
-									? "Command Code stream error"
-									: stringifyUnknown(gatewayEvent.error)),
-						);
+						case "finish-step":
+						case "finish": {
+							sawTerminalEvent = true;
+							const usage = gatewayEvent.usage ?? gatewayEvent.totalUsage;
+							if (usage) {
+								// The gateway reports inputTokens as the TOTAL input (cached + uncached),
+								// matching the Vercel AI SDK convention. Pi's Usage shape expects
+								// `input` and `cacheRead` to be disjoint — calculateCost multiplies
+								// each separately, so leaving cached tokens inside `input` would
+								// double-charge on paid models. Subtract to match the convention
+								// used by the built-in Anthropic provider in pi-ai.
+								const totalInputTokens = usage.inputTokens ?? usage.input_tokens ?? 0;
+								const cacheReadTokens =
+									usage.cachedInputTokens ??
+									usage.inputTokenDetails?.cacheReadTokens ??
+									usage.raw?.prompt_cache_hit_tokens ??
+									0;
+								output.usage.input = Math.max(0, totalInputTokens - cacheReadTokens);
+								output.usage.output = usage.outputTokens ?? usage.output_tokens ?? 0;
+								output.usage.cacheRead = cacheReadTokens;
+								output.usage.cacheWrite = 0;
+								output.usage.totalTokens =
+									output.usage.input +
+									output.usage.output +
+									output.usage.cacheRead +
+									output.usage.cacheWrite;
+								calculateCost(model, output.usage);
+							}
+							const reason = gatewayEvent.finishReason ?? gatewayEvent.rawFinishReason;
+							const sawToolCall = output.content.some((b) => b.type === "toolCall");
+							if (reason === "length") output.stopReason = "length";
+							else if (reason === "tool-calls" || reason === "tool_calls" || reason === "tool_use")
+								output.stopReason = "toolUse";
+							// Some OSS models report finishReason "stop" even when they emitted
+							// tool calls; pi must still route those as tool use (mirrors the
+							// cliproxy commandcode translator).
+							else if (sawToolCall) output.stopReason = "toolUse";
+							else output.stopReason = "stop";
+							break;
+						}
+						case "error": {
+							const streamError = new Error(
+								gatewayEvent.message ??
+									(gatewayEvent.error === undefined
+										? "Command Code stream error"
+										: stringifyUnknown(gatewayEvent.error)),
+							);
+							// A quota rejection can also arrive as a mid-stream error event.
+							// Only hand the request to the next key while nothing has streamed.
+							if (output.content.length === 0 && (await noteKeyFailure(candidate.key, streamError))) {
+								continue retry;
+							}
+							throw streamError;
+						}
 					}
 				}
+				if (!sawTerminalEvent) {
+					throw new Error("Command Code stream ended before a terminal event");
+				}
+				lastError = undefined;
+				break;
 			}
-			if (!sawTerminalEvent) {
-				throw new Error("Command Code stream ended before a terminal event");
+			if (lastError !== undefined) {
+				throw attempts > 1
+					? new Error(`Command Code tried ${attempts} of ${pool.length} keys: ${stringifyUnknown(lastError)}`)
+					: lastError;
 			}
 
 			stream.push({
@@ -1074,7 +1338,8 @@ async function getJson(path: string, apiKey: string): Promise<FetchResult> {
 	}
 }
 
-async function resolveUsageApiKey(ctx: ExtensionContext): Promise<string | undefined> {
+/** The key Pi itself resolved; the pool adds the extra keys on top of it. */
+async function resolvePiApiKey(ctx: ExtensionContext): Promise<string | undefined> {
 	const fromRegistry = await ctx.modelRegistry.getApiKeyForProvider("commandcode");
 	if (fromRegistry) return fromRegistry;
 	const fromEnv = process.env.COMMANDCODE_API_KEY;
@@ -1082,8 +1347,8 @@ async function resolveUsageApiKey(ctx: ExtensionContext): Promise<string | undef
 }
 
 async function runUsage(_args: string, ctx: ExtensionCommandContext): Promise<void> {
-	const apiKey = await resolveUsageApiKey(ctx);
-	if (!apiKey) {
+	const pool = await buildKeyPool(await resolvePiApiKey(ctx));
+	if (pool.length === 0) {
 		ctx.ui.notify(
 			"No Command Code API key. Add a commandcode api_key entry to ~/.pi/agent/auth.json, or set COMMANDCODE_API_KEY.",
 			"error",
@@ -1091,35 +1356,122 @@ async function runUsage(_args: string, ctx: ExtensionCommandContext): Promise<vo
 		return;
 	}
 
-	const [creditsResult, subscriptionResult] = await Promise.all([
-		getJson("/alpha/billing/credits", apiKey),
-		getJson("/alpha/billing/subscriptions", apiKey),
-	]);
+	let firstFailure: string | undefined;
+	for (const entry of availableKeys(pool)) {
+		const [creditsResult, subscriptionResult] = await Promise.all([
+			getJson("/alpha/billing/credits", entry.key),
+			getJson("/alpha/billing/subscriptions", entry.key),
+		]);
 
-	if (!creditsResult.ok) {
-		ctx.ui.notify(creditsResult.error, "error");
+		if (!creditsResult.ok) {
+			firstFailure ??= creditsResult.error;
+			continue;
+		}
+
+		const credits = parseCredits(creditsResult.data);
+		if (!credits) {
+			const snippet = previewRaw(JSON.stringify(creditsResult.data));
+			ctx.ui.notify(`Billing API changed shape. ${snippet}`.trim(), "error");
+			return;
+		}
+
+		let subscription: SubscriptionSnapshot | undefined;
+		let subscriptionError: string | undefined;
+		if (subscriptionResult.ok) {
+			subscription = parseSubscription(subscriptionResult.data);
+			if (!subscription) subscriptionError = "changed shape";
+		} else {
+			subscriptionError = subscriptionResult.error;
+		}
+
+		const exhaustion = exhaustionFromSnapshot(credits, subscription);
+		if (exhaustion) {
+			markKeyBlocked(entry.key, exhaustion);
+			continue;
+		}
+
+		const report = formatReport(credits, subscription, subscriptionError);
+		const keyLine =
+			pool.length > 1
+				? `${"Key".padEnd(7)}  #${pool.indexOf(entry) + 1}/${pool.length}  ${maskKey(entry.key)}`
+				: undefined;
+		const kind = credits.belowThreshold || credits.fiveHour?.exceeded || credits.weekly?.exceeded ? "warning" : "info";
+		ctx.ui.notify([report, keyLine].filter(Boolean).join("\n"), kind);
 		return;
 	}
 
-	const credits = parseCredits(creditsResult.data);
-	if (!credits) {
-		const snippet = previewRaw(JSON.stringify(creditsResult.data));
-		ctx.ui.notify(`Billing API changed shape. ${snippet}`.trim(), "error");
+	const parked = availableKeys(pool).length === 0;
+	ctx.ui.notify(
+		parked
+			? `All ${pool.length} Command Code keys are quota-limited (${parkingSummary(pool)}). Add another key with /cc-keys add user_...`
+			: (firstFailure ?? "Command Code billing API failed."),
+		parked ? "warning" : "error",
+	);
+}
+
+// ---- /cc-keys ------------------------------------------------------------
+
+function keysReport(pool: PoolKey[]): string {
+	if (pool.length === 0) return "No Command Code keys. Add one with /cc-keys add user_...";
+	const active = availableKeys(pool)[0];
+	const lines = [
+		`Command Code keys  ${pool.length}  (active: ${active ? `#${pool.indexOf(active) + 1}` : "none"})`,
+	];
+	pool.forEach((entry, index) => {
+		const block = keyBlock(entry);
+		const state = block ? `${block.reason} exhausted, reset ${formatReset(block.blockedUntil)}` : "ready";
+		lines.push(
+			`${entry === active ? "→" : " "} ${index + 1}  ${maskKey(entry.key).padEnd(20)} ${KEY_SOURCE_LABEL[entry.source].padEnd(20)} ${state}`,
+		);
+	});
+	lines.push("Add: /cc-keys add user_...   Remove: /cc-keys remove <n>");
+	return lines.join("\n");
+}
+
+async function runKeys(args: string, ctx: ExtensionCommandContext): Promise<void> {
+	const [subcommand, ...rest] = args.trim().split(/\s+/);
+	const piKey = await resolvePiApiKey(ctx);
+	const pool = await buildKeyPool(piKey);
+
+	if (subcommand === "add") {
+		const key = rest.join("");
+		if (!key) {
+			ctx.ui.notify("Usage: /cc-keys add user_...", "error");
+			return;
+		}
+		if (parseKeyList(process.env.COMMANDCODE_API_KEYS).length > 0) {
+			ctx.ui.notify("COMMANDCODE_API_KEYS is set; add the key there instead.", "error");
+			return;
+		}
+		if (pool.some((entry) => entry.key === key)) {
+			ctx.ui.notify(`Key ${maskKey(key)} is already configured.`, "info");
+			return;
+		}
+		const stored = await readKeysFile();
+		stored.push(key);
+		await writeKeysFile(stored);
+		ctx.ui.notify(`Added Command Code key ${maskKey(key)}.\n${keysReport(await buildKeyPool(piKey))}`, "info");
 		return;
 	}
 
-	let subscription: SubscriptionSnapshot | undefined;
-	let subscriptionError: string | undefined;
-	if (subscriptionResult.ok) {
-		subscription = parseSubscription(subscriptionResult.data);
-		if (!subscription) subscriptionError = "changed shape";
-	} else {
-		subscriptionError = subscriptionResult.error;
+	if (subcommand === "remove") {
+		const target = rest[0] ?? "";
+		const index = /^\d+$/.test(target) ? Number(target) : Number.NaN;
+		const entry = pool[index - 1];
+		if (!entry) {
+			ctx.ui.notify(`Usage: /cc-keys remove <1-${pool.length}>`, "error");
+			return;
+		}
+		if (entry.source !== "file") {
+			ctx.ui.notify(`Key #${index} comes from ${KEY_SOURCE_LABEL[entry.source]}; remove it there.`, "error");
+			return;
+		}
+		await writeKeysFile((await readKeysFile()).filter((key) => key !== entry.key));
+		ctx.ui.notify(`Removed Command Code key ${maskKey(entry.key)}.`, "info");
+		return;
 	}
 
-	const report = formatReport(credits, subscription, subscriptionError);
-	const kind = credits.belowThreshold || credits.fiveHour?.exceeded || credits.weekly?.exceeded ? "warning" : "info";
-	ctx.ui.notify(report, kind);
+	ctx.ui.notify(keysReport(pool), "info");
 }
 
 // ---- Quota bar (below editor) -------------------------------------------
@@ -1154,6 +1506,7 @@ let quotaGeneration = 0;
 let lastQuotaSnapshot:
 	| { credits: CreditsSnapshot; subscription?: SubscriptionSnapshot }
 	| undefined;
+let lastQuotaKey: string | undefined;
 
 function clearQuotaTimer(): void {
 	if (!quotaTimer) return;
@@ -1184,27 +1537,47 @@ async function refreshQuotaBar(ctx: ExtensionContext): Promise<void> {
 	const generation = ++quotaGeneration;
 	if (!isCommandCodeModel(ctx.model)) {
 		lastQuotaSnapshot = undefined;
+		lastQuotaKey = undefined;
 		hideQuotaBar(ctx);
 		clearQuotaTimer();
 		return;
 	}
-	const apiKey = await resolveUsageApiKey(ctx);
+	const pool = await buildKeyPool(await resolvePiApiKey(ctx));
 	if (generation !== quotaGeneration) return;
-	if (!apiKey) return;
-	const snapshot = await loadQuota(apiKey);
-	if (generation !== quotaGeneration) return;
-	if (!snapshot) return;
-	const subscription = snapshot.subscription ?? lastQuotaSnapshot?.subscription;
-	const line = formatQuotaBar(snapshot.credits, subscription, (kind, text) =>
-		ctx.ui.theme.fg(kind, text),
-	);
-	if (!line) {
-		if (!lastQuotaSnapshot) hideQuotaBar(ctx);
+	if (pool.length === 0) return;
+
+	for (const entry of availableKeys(pool)) {
+		const snapshot = await loadQuota(entry.key);
+		if (generation !== quotaGeneration) return;
+		if (!snapshot) continue;
+
+		const exhaustion = exhaustionFromSnapshot(snapshot.credits, snapshot.subscription);
+		if (exhaustion) {
+			markKeyBlocked(entry.key, exhaustion);
+			continue;
+		}
+
+		const subscription = snapshot.subscription ?? (lastQuotaKey === entry.key ? lastQuotaSnapshot?.subscription : undefined);
+		const line = formatQuotaBar(snapshot.credits, subscription, (kind, text) =>
+			ctx.ui.theme.fg(kind, text),
+		);
+		if (!line) {
+			if (!lastQuotaSnapshot) hideQuotaBar(ctx);
+			return;
+		}
+		lastQuotaSnapshot = { credits: snapshot.credits, subscription };
+		lastQuotaKey = entry.key;
+		showQuotaBar(ctx, pool.length > 1 ? `#${pool.indexOf(entry) + 1}/${pool.length} ${line}` : line);
+		ensureQuotaTimer();
 		return;
 	}
-	lastQuotaSnapshot = { credits: snapshot.credits, subscription };
-	showQuotaBar(ctx, line);
-	ensureQuotaTimer();
+
+	// Every key is parked, or the fetches failed: show the parked line only when
+	// the keys themselves reported exhaustion, never on a billing outage.
+	if (availableKeys(pool).length === 0) {
+		showQuotaBar(ctx, `All ${pool.length} Command Code keys are quota-limited · ${parkingSummary(pool)}`);
+		ensureQuotaTimer();
+	}
 }
 
 function bindQuotaSession(ctx: ExtensionContext): void {
@@ -1240,6 +1613,10 @@ export default async function (pi: ExtensionAPI) {
 		description: "Show Command Code plan credits and usage limits",
 		handler: runUsage,
 	});
+	pi.registerCommand("cc-keys", {
+		description: "List, add, or remove Command Code API keys used for quota failover",
+		handler: runKeys,
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		bindQuotaSession(ctx);
@@ -1257,6 +1634,7 @@ export default async function (pi: ExtensionAPI) {
 		clearQuotaTimer();
 		quotaCtx = undefined;
 		lastQuotaSnapshot = undefined;
+		lastQuotaKey = undefined;
 		quotaGeneration += 1;
 	});
 }
