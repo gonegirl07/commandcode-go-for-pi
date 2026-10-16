@@ -165,6 +165,106 @@ test("forwards supported DeepSeek effort levels to alpha/generate", async (t) =>
 	);
 });
 
+// Pi 1.x carries the prompt and tool declarations in the transcript's system
+// messages and hands providers a TranscriptContext, so `context.tools` and
+// `context.systemPrompt` are absent. Every request then went out with
+// `tools: []`, which makes OSS models (DeepSeek V4 in particular) fall back to
+// emitting their native tool markup as plain text instead of tool calls.
+function transcriptContext({ prompt, tools, messages = [] }) {
+	return {
+		messages: [
+			{
+				role: "system",
+				content: prompt,
+				toolsAdded: tools,
+				timestamp: Date.UTC(2026, 9, 16, 0, 0),
+			},
+			...messages,
+		],
+	};
+}
+
+test("declares transcript tools to alpha/generate", async (t) => {
+	const bodies = [];
+	t.mock.method(globalThis, "fetch", async (_input, init) => {
+		bodies.push(JSON.parse(init.body));
+		return terminalResponse();
+	});
+
+	const terminal = await drain(
+		provider.streamSimple(
+			commandCodeModel(),
+			transcriptContext({
+				prompt: "You are a helpful assistant.",
+				tools: [
+					{
+						name: "bash",
+						description: "Run a shell command",
+						parameters: {
+							type: "object",
+							properties: { command: { type: "string" } },
+							required: ["command"],
+						},
+					},
+				],
+			}),
+			{ apiKey: "user_test" },
+		),
+	);
+
+	assert.equal(terminal?.type, "done");
+	assert.equal(bodies.length, 1);
+	assert.deepEqual(
+		bodies[0].params.tools.map((tool) => tool.name),
+		["bash"],
+	);
+	assert.deepEqual(bodies[0].params.tools[0].input_schema.required, ["command"]);
+});
+
+test("sends the transcript system prompt to alpha/generate", async (t) => {
+	const bodies = [];
+	t.mock.method(globalThis, "fetch", async (_input, init) => {
+		bodies.push(JSON.parse(init.body));
+		return terminalResponse();
+	});
+
+	await drain(
+		provider.streamSimple(commandCodeModel(), transcriptContext({ prompt: "SENTINEL-PROMPT", tools: [] }), {
+			apiKey: "user_test",
+		}),
+	);
+
+	assert.equal(bodies.length, 1);
+	assert.equal(bodies[0].params.system, "SENTINEL-PROMPT");
+});
+
+test("still reads a raw Context with top-level tools", async (t) => {
+	const bodies = [];
+	t.mock.method(globalThis, "fetch", async (_input, init) => {
+		bodies.push(JSON.parse(init.body));
+		return terminalResponse();
+	});
+
+	await drain(
+		provider.streamSimple(
+			commandCodeModel(),
+			{
+				systemPrompt: "RAW-PROMPT",
+				messages: [],
+				tools: [{ name: "bash", description: "Run a shell command", parameters: { type: "object" } }],
+			},
+			{ apiKey: "user_test" },
+		),
+	);
+
+	assert.equal(bodies.length, 1);
+	assert.deepEqual(
+		bodies[0].params.tools.map((tool) => tool.name),
+		["bash"],
+	);
+	assert.equal(bodies[0].params.system, "RAW-PROMPT");
+});
+
 test("omits unsupported efforts and leaves unrelated models unchanged", async (t) => {
 	const deepSeek = provider.models.find((entry) => entry.id === "deepseek/deepseek-v4-pro");
 	const kimi = provider.models.find((entry) => entry.id === "moonshotai/Kimi-K3");

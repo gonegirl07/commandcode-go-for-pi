@@ -46,9 +46,15 @@ import {
 	type Message,
 	type Model,
 	type SimpleStreamOptions,
+	type Tool,
 	calculateCost,
 	createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
+// Pi 1.x resolves the prompt and tool declarations from the transcript
+// (`getCurrentTools`, `getCurrentSystemPrompt`). Those exports are absent on older Pi,
+// and a static named import of a missing export is a SyntaxError at module load, so
+// import the namespace and probe for the helpers at runtime.
+import * as piAi from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const BASE_URL = "https://api.commandcode.ai";
@@ -728,6 +734,23 @@ async function sendGenerateRequest(
 	return body;
 }
 
+/**
+ * Tools and the system prompt live in the transcript's system messages on Pi 1.x, where
+ * providers receive a TranscriptContext and `context.tools` / `context.systemPrompt` are
+ * unset. Older Pi versions populate those raw fields instead. Sending `tools: []` makes
+ * OSS models such as DeepSeek V4 emit their native tool markup as plain text rather than
+ * tool calls, so prefer the transcript and fall back to the raw fields.
+ */
+function resolveTranscript(context: Context): { tools: Tool[]; system: string } {
+	const transcriptTools = typeof piAi.getCurrentTools === "function" ? piAi.getCurrentTools(context.messages) : [];
+	const transcriptPrompt =
+		typeof piAi.getCurrentSystemPrompt === "function" ? piAi.getCurrentSystemPrompt(context.messages) : "";
+	return {
+		tools: transcriptTools.length > 0 ? transcriptTools : (context.tools ?? []),
+		system: transcriptPrompt || (context.systemPrompt ?? ""),
+	};
+}
+
 function streamCommandCode(
 	model: Model<Api>,
 	context: Context,
@@ -770,7 +793,8 @@ function streamCommandCode(
 
 			stream.push({ type: "start", partial: output });
 
-			const tools = (context.tools ?? []).map((t) => ({
+			const { tools: declaredTools, system } = resolveTranscript(context);
+			const tools = declaredTools.map((t) => ({
 				name: t.name,
 				description: t.description,
 				input_schema: t.parameters,
@@ -791,7 +815,7 @@ function streamCommandCode(
 				permissionMode: "standard",
 				params: {
 					model: model.id,
-					system: context.systemPrompt ?? "",
+					system,
 					messages: convertMessages(context.messages),
 					tools,
 					max_tokens: options?.maxTokens ?? model.maxTokens ?? 8192,
